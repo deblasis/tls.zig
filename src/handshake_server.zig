@@ -973,15 +973,16 @@ pub const NonBlock = struct {
     /// multiple times: clears `peer_cert_der` after free. Calling on a
     /// no-allocator instance is a no-op.
     pub fn deinit(self: *Self) void {
-        if (self.inner.peer_cert_der) |bytes| {
-            // Allocator MUST be non-null if we have an owned copy — the
-            // copy is created inside the same `if (h.allocator)` guard
-            // in readClientFlight2. Defensive unwrap.
-            if (self.inner.allocator) |alloc| {
-                alloc.free(bytes);
-            }
+        const bytes = self.inner.peer_cert_der orelse return;
+        // Allocator MUST be non-null if we have an owned copy — the
+        // copy is created inside the same `if (h.allocator)` guard
+        // in readClientFlight2. Defensive unwrap.
+        const alloc = self.inner.allocator orelse {
             self.inner.peer_cert_der = null;
-        }
+            return;
+        };
+        alloc.free(bytes);
+        self.inner.peer_cert_der = null;
     }
 
     /// Accessor for the verified peer's leaf DER bytes. Returns null in
@@ -994,9 +995,9 @@ pub const NonBlock = struct {
     /// The returned slice is owned by this `NonBlock.Server`; lifetime
     /// equals server lifetime (freed by `deinit`). Callers that need
     /// longer retention MUST copy into their own storage.
-    pub fn peerCertificate(self: Self) ?[]const u8 {
+    pub fn peerCertificate(self: *const Self) ?[]const u8 {
         if (!self.done()) return null;
-        return self.inner.peer_cert_der;
+        return self.inner.peerCertificate();
     }
 
     /// Accessor for the parsed SNI hostname from the client's
@@ -1109,7 +1110,7 @@ pub const NonBlock = struct {
                 }
                 // setAuth was called — finalize signature scheme +
                 // validate against the cached client offer.
-                self.inner.finalizeAuthAndValidateSigScheme() catch |err| return err;
+                try self.inner.finalizeAuthAndValidateSigScheme();
                 self.state = .client_flight_1;
                 continue :out self.state;
             },
