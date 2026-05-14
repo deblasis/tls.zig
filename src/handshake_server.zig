@@ -115,6 +115,30 @@ pub const Handshake = struct {
     ///   - OOM during dupe (handshake aborts with `error.OutOfMemory`).
     peer_cert_der: ?[]const u8 = null,
 
+    /// Inline storage for the parsed SNI hostname. 256 bytes is the
+    /// round-number safety margin over RFC 5890's 253-octet DNS hostname
+    /// cap (SNI per RFC 6066 §3 prohibits the trailing dot, so 253 is
+    /// the effective max). Bytes are meaningful only when
+    /// `sni_host_len > 0`. Pinned to Handshake lifetime; NOT a slice
+    /// into the input buffer (which would dangle across the
+    /// `awaiting_auth` pause introduced in a follow-up commit).
+    sni_host_buf: [256]u8 = undefined,
+
+    /// Length of the parsed SNI hostname in `sni_host_buf`. Zero means
+    /// SNI was absent OR malformed (we treat malformed SNI as absent —
+    /// defensive, falls back to default cert). `sniHost()` returns
+    /// `sni_host_buf[0..sni_host_len]` when non-zero, null otherwise.
+    sni_host_len: u8 = 0,
+
+    /// Accessor for the parsed SNI hostname. Returns null when
+    /// sni_host_len == 0 (absent OR malformed); else returns
+    /// `sni_host_buf[0..sni_host_len]`. Lifetime = Handshake lifetime
+    /// (inline buffer is pinned).
+    pub fn sniHost(self: *const Handshake) ?[]const u8 {
+        if (self.sni_host_len == 0) return null;
+        return self.sni_host_buf[0..self.sni_host_len];
+    }
+
     /// Accessor for the verified peer's leaf DER bytes. Returns null
     /// when the handshake has not captured one. Lifetime equals the
     /// owning `NonBlock.Server` (freed by `deinit`).
@@ -539,6 +563,62 @@ pub const Handshake = struct {
                         if (!found) return error.TlsHandshakeFailure;
                     }
                 },
+                .server_name => {
+                    // RFC 6066 §3 ServerNameList. Each ServerName has a
+                    // NameType (u8); body length is DEFINED ONLY for
+                    // NameType.host_name(0) (uint16-prefixed HostName).
+                    // For unknown NameTypes, RFC 6066 does NOT define a
+                    // wire-level length prefix — generic skip is unsafe
+                    // (we'd consume bytes that aren't length-prefixed
+                    // and catastrophically mis-align). Algorithm:
+                    //   - Walk entries.
+                    //   - On NameType.host_name(0): parse u16 len +
+                    //     bytes. First host_name wins (defensive against
+                    //     malicious duplicate hostnames). Malformed
+                    //     entry (zero-length, > 255 bytes, body
+                    //     overrun) → treat SNI as absent (don't error
+                    //     the handshake).
+                    //   - On any other NameType: STOP parsing the list
+                    //     (cannot advance safely). SNI is whatever
+                    //     host_name was seen before this point
+                    //     (typically none → sni_host_len stays 0).
+                    // Malformed list-level lengths flow through the
+                    // existing decoder's error path.
+                    const list_len_u16 = try d.decode(u16);
+                    const list_end = list_len_u16 + d.idx;
+                    if (list_end > d.payload.len) return error.TlsDecodeError;
+                    while (d.idx < list_end) {
+                        const name_type = try d.decode(u8);
+                        if (name_type != 0) {
+                            // Unknown NameType — stop parsing.
+                            break;
+                        }
+                        const name_len = try d.decode(u16);
+                        if (name_len == 0 or name_len > 255 or d.idx + name_len > list_end) {
+                            // Malformed host_name entry — treat SNI as
+                            // absent. Clear any previously-captured
+                            // host_name to match the "first-malformed-
+                            // wins-absent" semantic — defensive against
+                            // attackers crafting a valid+malformed pair.
+                            h.sni_host_len = 0;
+                            const remaining = list_end - d.idx;
+                            try d.skip(remaining);
+                            break;
+                        }
+                        const bytes = try d.slice(name_len);
+                        if (h.sni_host_len == 0) {
+                            // First host_name wins.
+                            @memcpy(h.sni_host_buf[0..name_len], bytes);
+                            h.sni_host_len = @intCast(name_len);
+                        }
+                    }
+                    // If we broke out early on an unknown NameType, skip
+                    // any remaining bytes in the extension body to keep
+                    // the outer decoder aligned with extension_len.
+                    if (d.idx < list_end) {
+                        try d.skip(list_end - d.idx);
+                    }
+                },
                 .application_layer_protocol_negotiation => {
                     // RFC 7301: parse client ALPN extension and select a protocol
                     if (server_alpn_protocols.len > 0) {
@@ -717,6 +797,15 @@ pub const NonBlock = struct {
     pub fn peerCertificate(self: Self) ?[]const u8 {
         if (!self.done()) return null;
         return self.inner.peer_cert_der;
+    }
+
+    /// Accessor for the parsed SNI hostname from the client's
+    /// ClientHello. Forwards to `Handshake.sniHost()`. Returns null
+    /// when SNI was absent, malformed, or zero-length. The returned
+    /// slice is pinned to the `Handshake` lifetime (inline buffer;
+    /// not a slice into the input buffer).
+    pub fn sniHost(self: *const Self) ?[]const u8 {
+        return self.inner.sniHost();
     }
 
     fn recv(self: *Self) !void {
