@@ -130,6 +130,40 @@ pub const Handshake = struct {
     /// `sni_host_buf[0..sni_host_len]` when non-zero, null otherwise.
     sni_host_len: u8 = 0,
 
+    /// Cached client `signature_algorithms` list from ClientHello.
+    /// Populated during `readClientHello`'s signature_algorithms branch.
+    /// After SNI-driven `setAuth()` resolves the auth,
+    /// `finalizeAuthAndValidateSigScheme` checks the resolved cert's
+    /// signature scheme against this cache (since the original
+    /// ClientHello bytes are gone by then). 64 entries is well over
+    /// the realistic upper bound (~15 schemes).
+    client_signature_schemes_buf: [64]proto.SignatureScheme = undefined,
+    client_signature_schemes_len: u8 = 0,
+
+    /// Auth-resolution gate. Set true when:
+    ///   (a) legacy construction: Options.auth was non-null at init
+    ///       time — `initWithAllocator` populates `opt_auth` and sets
+    ///       this true so the new awaiting_auth pause is skipped
+    ///       (bit-identical legacy behavior).
+    ///   (b) SNI dispatch: caller invokes `setAuth()` (or
+    ///       `rejectNoMatch`) after `readClientHello` returns; this
+    ///       flag advances the state machine past the pause.
+    auth_resolved: bool = false,
+
+    /// Runtime-resolved server auth. The load-bearing pointer that
+    /// `serverFlight` reads instead of `opt.auth` directly. Legacy
+    /// callers populate this at construction; SNI callers populate via
+    /// `setAuth()`. The data behind the pointer is owned by the caller,
+    /// not the library.
+    opt_auth: ?*CertKeyPair = null,
+
+    /// Set by `rejectNoMatch()`. When true, `serverFlight` raises
+    /// `error.TlsUnrecognizedName` before emitting any post-ClientHello
+    /// flight bytes. The engine's existing alert-from-error machinery
+    /// translates the error into TLS alert `unrecognized_name(112)` per
+    /// RFC 6066 §3.
+    no_match_abort: bool = false,
+
     /// Accessor for the parsed SNI hostname. Returns null when
     /// sni_host_len == 0 (absent OR malformed); else returns
     /// `sni_host_buf[0..sni_host_len]`. Lifetime = Handshake lifetime
@@ -187,10 +221,43 @@ pub const Handshake = struct {
 
     fn initKeys(h: *Self, opt: Options) void {
         opt.rng.bytes(&h.server_random);
-        if (opt.auth) |a| {
+        // Derive signature_scheme from the currently-known auth:
+        // opt_auth (set by `setAuth()` for SNI dispatch) takes
+        // precedence over opt.auth (set at construction for legacy
+        // callers). When neither is set yet (SNI awaiting setAuth),
+        // leave signature_scheme = 0; the value is finalized in
+        // `finalizeAuthAndValidateSigScheme` after setAuth.
+        const auth = h.opt_auth orelse opt.auth;
+        if (auth) |a| {
             // required signature scheme in client hello
             h.signature_scheme = a.key.signature_scheme;
         }
+    }
+
+    /// Validate the resolved auth's signature scheme against the
+    /// client's offered `signature_algorithms`, then set
+    /// `h.signature_scheme`. Called after `setAuth()` for SNI dispatch;
+    /// no-op when h.opt_auth was already resolved at construction
+    /// (initKeys already set h.signature_scheme + readClientHello
+    /// already validated inline).
+    ///
+    /// Returns error.TlsHandshakeFailure if the resolved cert's
+    /// signature scheme isn't in the client's offered set. The engine
+    /// emits handshake_failure(40) before any Certificate bytes hit the
+    /// wire — cleaner than letting the client reject post-Certificate
+    /// with a confusing decode-error alert.
+    fn finalizeAuthAndValidateSigScheme(h: *Self) !void {
+        const auth = h.opt_auth orelse return; // no auth: server-without-cert mode
+        h.signature_scheme = auth.key.signature_scheme;
+        // If the client didn't send signature_algorithms (rare but
+        // spec-legal for TLS 1.3 when only PSK is in play), the lib's
+        // existing client-flight would have already errored. With a
+        // non-empty cache: validate.
+        if (h.client_signature_schemes_len == 0) return;
+        for (h.client_signature_schemes_buf[0..h.client_signature_schemes_len]) |scheme| {
+            if (scheme == h.signature_scheme) return;
+        }
+        return error.TlsHandshakeFailure;
     }
 
     fn clientFlight1(h: *Self, opt: Options) !void {
@@ -214,6 +281,12 @@ pub const Handshake = struct {
     }
 
     fn serverFlight(h: *Self, opt: Options) !void {
+        // Refuse-unmatched-SNI hook (rejectNoMatch). When the caller
+        // refuses to serve any cert for the presented SNI, the engine
+        // emits an unrecognized_name alert before any post-ClientHello
+        // flight bytes hit the wire.
+        if (h.no_match_abort) return error.TlsUnrecognizedName;
+
         var w: record.Writer = .initFromIo(h.output);
 
         const shared_key = brk: {
@@ -256,7 +329,12 @@ pub const Handshake = struct {
             h.transcript.update(hw.buffered());
             try h.writeEncrypted(&w, hw.buffered());
         }
-        if (opt.auth) |auth| {
+        // Read the runtime-resolved auth from `h.opt_auth` (populated
+        // either at construction from `opt.auth` by `initWithAllocator`
+        // for legacy callers, or via `setAuth()` for SNI dispatch
+        // callers). Bit-identical for the legacy path; the indirection
+        // just lets SNI vary the cert.
+        if (h.opt_auth) |auth| {
             const cb = CertificateBuilder{
                 .rng = opt.rng,
                 .cert_key_pair = auth,
@@ -549,18 +627,34 @@ pub const Handshake = struct {
                     }
                 },
                 .signature_algorithms => {
-                    if (@intFromEnum(h.signature_scheme) == 0) {
-                        try d.skip(extension_len);
-                    } else {
-                        var found = false;
-                        const list_len = try d.decode(u16);
-                        if (list_len == 0) return error.TlsDecodeError;
-                        const end_idx = list_len + d.idx;
-                        while (d.idx < end_idx) {
-                            const signature_scheme = try d.decode(proto.SignatureScheme);
-                            if (signature_scheme == h.signature_scheme) found = true;
+                    // Cache the client's offered signature schemes so
+                    // we can validate the post-`setAuth` resolved cert's
+                    // signature scheme later (SNI dispatch path).
+                    // Legacy path (signature_scheme already set by
+                    // initKeys from pinned opt.auth) still validates
+                    // inline.
+                    const list_len = try d.decode(u16);
+                    if (list_len == 0) return error.TlsDecodeError;
+                    const end_idx = list_len + d.idx;
+                    var found = false;
+                    while (d.idx < end_idx) {
+                        const signature_scheme = try d.decode(proto.SignatureScheme);
+                        // Cache with a defensive buffer cap; truncating
+                        // is fine — we only need enough schemes to
+                        // validate against, and 64 is well above any
+                        // real ClientHello.
+                        if (h.client_signature_schemes_len < h.client_signature_schemes_buf.len) {
+                            h.client_signature_schemes_buf[h.client_signature_schemes_len] = signature_scheme;
+                            h.client_signature_schemes_len += 1;
                         }
-                        if (!found) return error.TlsHandshakeFailure;
+                        if (@intFromEnum(h.signature_scheme) != 0 and
+                            signature_scheme == h.signature_scheme)
+                        {
+                            found = true;
+                        }
+                    }
+                    if (@intFromEnum(h.signature_scheme) != 0 and !found) {
+                        return error.TlsHandshakeFailure;
                     }
                 },
                 .server_name => {
@@ -728,9 +822,22 @@ pub const NonBlock = struct {
     opt: Options = undefined,
     state: State = undefined,
 
+    /// Internal state machine. The `awaiting_auth` variant sits between
+    /// `client_flight_1` (ClientHello consumed) and `server_flight`
+    /// (ServerHello emit). When the caller constructed `NonBlock.Server`
+    /// with `opt.auth = null`, `run()` returns `.awaiting_auth` after
+    /// `readClientHello`. The caller inspects `sniHost()`, calls
+    /// `setAuth()` or `rejectNoMatch()`, then re-invokes `run()` to
+    /// proceed.
+    ///
+    /// Legacy callers (`Options.auth` set at construction):
+    /// `initWithAllocator` populates `inner.opt_auth` and sets
+    /// `inner.auth_resolved = true`, so `run()` skips `awaiting_auth`
+    /// entirely. Bit-identical legacy behavior.
     const State = enum {
         init,
         client_flight_1,
+        awaiting_auth,
         server_flight,
         client_flight_2,
 
@@ -738,6 +845,55 @@ pub const NonBlock = struct {
             self.* = @enumFromInt(@intFromEnum(self.*) + 1);
         }
     };
+
+    /// Observable state surfaced from `runState()`. Maps the internal
+    /// State enum to a 3-way contract callers can switch on:
+    ///   .in_progress — engine has more work; caller pushes more
+    ///                  ciphertext via `run()` (legacy behavior).
+    ///   .awaiting_auth — ClientHello has been consumed; caller MUST
+    ///                    call setAuth() or rejectNoMatch() before
+    ///                    invoking run() again. Returned exactly once
+    ///                    per SNI-dispatch handshake.
+    ///   .done — handshake complete.
+    pub const RunState = enum {
+        in_progress,
+        awaiting_auth,
+        done,
+    };
+
+    /// Observe the current state machine position. Returns
+    /// `.awaiting_auth` only when the engine has consumed ClientHello
+    /// AND the caller has not yet resolved auth via `setAuth()` or
+    /// `rejectNoMatch()`. Otherwise reports `.in_progress` or `.done`
+    /// mirroring `done()`.
+    pub fn runState(self: Self) RunState {
+        if (self.done()) return .done;
+        if (self.state == .awaiting_auth and !self.inner.auth_resolved) return .awaiting_auth;
+        return .in_progress;
+    }
+
+    /// Resolve the auth and advance past the `.awaiting_auth` pause.
+    /// `cert_key_pair` MUST be a valid pointer; the engine emits
+    /// Certificate using it on the next `run()`. After `setAuth`, the
+    /// post-resolution `signature_scheme` is validated against the
+    /// client's offered `signature_algorithms` list (cached during
+    /// `readClientHello`) — mismatch trips `error.TlsHandshakeFailure`
+    /// on the next `run()`.
+    pub fn setAuth(
+        self: *Self,
+        cert_key_pair: *CertKeyPair,
+    ) void {
+        self.inner.opt_auth = cert_key_pair;
+        self.inner.auth_resolved = true;
+    }
+
+    /// Refuse the handshake with TLS alert `unrecognized_name(112)` per
+    /// RFC 6066 §3. The lib's existing alert-from-error machinery
+    /// translates the error raised in `serverFlight`.
+    pub fn rejectNoMatch(self: *Self) void {
+        self.inner.no_match_abort = true;
+        self.inner.auth_resolved = true;
+    }
 
     pub fn init(opt: Options) Self {
         // Back-compat entry point. No allocator → no leaf DER capture.
@@ -760,6 +916,50 @@ pub const NonBlock = struct {
             .output = undefined,
             .allocator = allocator,
         };
+        // Legacy back-compat path: when the caller constructed Options
+        // with `auth` non-null OR null (server-without-cert mode), mark
+        // `auth_resolved = true` so the new awaiting_auth pause is
+        // never entered. Bit-identical existing behavior. SNI dispatch
+        // callers MUST use `initForSniDispatch` to opt into the pause.
+        if (opt.auth) |a| {
+            inner.opt_auth = a;
+        }
+        inner.auth_resolved = true;
+        inner.initKeys(opt);
+        return .{
+            .opt = opt,
+            .inner = inner,
+            .state = .init,
+        };
+    }
+
+    /// SNI-dispatch constructor. Constructs a `NonBlock.Server` that
+    /// pauses after consuming the ClientHello so the caller can inspect
+    /// `sniHost()` and pick a cert via `setAuth()` (or refuse via
+    /// `rejectNoMatch()`).
+    ///
+    /// `opt.auth` MUST be null on entry (the caller will supply the
+    /// auth via `setAuth()`); a non-null `opt.auth` would shadow the
+    /// resolved cert. `allocator` may be null when the caller does not
+    /// need to capture the peer's client certificate (no mTLS).
+    ///
+    /// Workflow:
+    ///   1. Construct via `initForSniDispatch(opt, allocator)`.
+    ///   2. Call `run(...)`. When `runState() == .awaiting_auth`,
+    ///      inspect `sniHost()` and invoke either `setAuth(*ckp)` or
+    ///      `rejectNoMatch()`.
+    ///   3. Call `run(...)` again — proceeds through ServerHello and
+    ///      the rest of the handshake.
+    pub fn initForSniDispatch(opt: Options, allocator: ?std.mem.Allocator) Self {
+        std.debug.assert(opt.auth == null);
+        var inner: Handshake = .{
+            .input = undefined,
+            .output = undefined,
+            .allocator = allocator,
+        };
+        // auth_resolved stays false → run() pauses at awaiting_auth
+        // after readClientHello; caller invokes setAuth() to populate
+        // opt_auth before continuing.
         inner.initKeys(opt);
         return .{
             .opt = opt,
@@ -815,7 +1015,20 @@ pub const NonBlock = struct {
         switch (self.state) {
             .init => {
                 try self.inner.clientFlight1(self.opt);
-                self.state.next();
+                // Branch on auth_resolved. Legacy callers (opt.auth
+                // non-null at construction): initWithAllocator already
+                // set auth_resolved = true, so we advance to
+                // .client_flight_1 (ServerHello emit) — bit-identical
+                // legacy behavior. SNI-dispatch callers (opt.auth null
+                // at construction): auth_resolved is false; advance to
+                // .awaiting_auth so the next run() returns control to
+                // the caller. The caller invokes setAuth() (which flips
+                // auth_resolved true) before calling run() again.
+                if (self.inner.auth_resolved) {
+                    self.state = .client_flight_1;
+                } else {
+                    self.state = .awaiting_auth;
+                }
             },
             .server_flight => {
                 try self.inner.clientFlight2(self.opt);
@@ -876,13 +1089,42 @@ pub const NonBlock = struct {
                 recv_pos = reader.seek;
                 continue :out self.state;
             },
+            .awaiting_auth => {
+                // SNI dispatch pause. The caller is expected to inspect
+                // `sniHost()`, choose a cert via their dispatch table,
+                // and invoke `setAuth()` BEFORE calling run() again.
+                // Once setAuth() flips auth_resolved to true, we
+                // transition to .client_flight_1 and proceed to emit
+                // ServerHello.
+                if (!self.inner.auth_resolved) {
+                    // Caller hasn't resolved yet — return control. recv_pos
+                    // may be non-zero (ClientHello bytes were consumed in
+                    // `.init` above); send is empty.
+                    return .{
+                        .recv_pos = recv_pos,
+                        .send_pos = writer.end,
+                        .unused_recv = recv_buf[recv_pos..],
+                        .send = writer.buffered(),
+                    };
+                }
+                // setAuth was called — finalize signature scheme +
+                // validate against the cached client offer.
+                self.inner.finalizeAuthAndValidateSigScheme() catch |err| return err;
+                self.state = .client_flight_1;
+                continue :out self.state;
+            },
             .client_flight_1 => {
                 if (recv_buf.ptr == send_buf.ptr and recv_pos != recv_buf.len) {
                     // recv buffer is fully consumed, same buffer can be used for write
                     return error.TlsUnexpectedMessage;
                 }
                 try self.inner.serverFlight(self.opt);
-                self.state.next();
+                // Advance directly to .server_flight (skipping the
+                // .awaiting_auth slot since we may have entered via
+                // either the legacy path or post-setAuth path; in
+                // either case auth is resolved and we need to wait for
+                // the client's flight 2 next).
+                self.state = .server_flight;
             },
             .client_flight_2 => {
                 // done
