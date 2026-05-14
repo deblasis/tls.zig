@@ -1149,3 +1149,582 @@ pub const NonBlock = struct {
         return self.inner.alpn_protocol;
     }
 };
+
+// =====================================================================
+// Tests for the mTLS post-handshake identity (peerCertificate) + SNI
+// dispatch (sniHost / setAuth / rejectNoMatch) hooks.
+// =====================================================================
+
+const handshake_client_mod = @import("handshake_client.zig");
+
+const mtls_test_cert_pem = @embedFile("testdata/mtls_test_cert.pem");
+const mtls_test_key_pem = @embedFile("testdata/mtls_test_key.pem");
+
+const max_ciphertext_record_len = @import("cipher.zig").max_ciphertext_record_len;
+
+/// Drives an in-memory TLS 1.3 handshake between a `NonBlock.Client` and
+/// a caller-provided `NonBlock.Server`. Returns when both sides are done
+/// or after `max_rounds` iterations (whichever comes first).
+fn driveHandshake(
+    cli: *handshake_client_mod.NonBlock,
+    srv: *NonBlock,
+    max_rounds: usize,
+) !void {
+    var cs_buf: [max_ciphertext_record_len]u8 = undefined;
+    var sc_buf: [max_ciphertext_record_len]u8 = undefined;
+    var sc_len: usize = 0;
+    var cs_len: usize = 0;
+
+    var rounds: usize = 0;
+    while (!cli.done() or !srv.done()) : (rounds += 1) {
+        if (rounds > max_rounds) return error.HandshakeTooManyRounds;
+
+        if (!cli.done()) {
+            const cr = try cli.run(sc_buf[0..sc_len], &cs_buf);
+            if (cr.recv_pos > 0) {
+                const remaining = sc_len - cr.recv_pos;
+                if (remaining > 0) {
+                    std.mem.copyForwards(u8, sc_buf[0..remaining], sc_buf[cr.recv_pos..sc_len]);
+                }
+                sc_len = remaining;
+            }
+            cs_len = cr.send.len;
+        }
+
+        if (!srv.done()) {
+            const sr = try srv.run(cs_buf[0..cs_len], &sc_buf);
+            if (sr.recv_pos > 0) {
+                const remaining = cs_len - sr.recv_pos;
+                if (remaining > 0) {
+                    std.mem.copyForwards(u8, cs_buf[0..remaining], cs_buf[sr.recv_pos..cs_len]);
+                }
+                cs_len = remaining;
+            }
+            sc_len = sr.send.len;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// mTLS — peerCertificate lifetime + back-compat
+// ---------------------------------------------------------------------
+
+test "peerCertificate returns leaf DER after handshake completes" {
+    const alloc = testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const now = std.Io.Clock.real.now(io);
+    const rng_impl: std.Random.IoSource = .{ .io = io };
+    const rng = rng_impl.interface();
+
+    // Self-signed P-256 cert (CA:TRUE, valid until 2100) reused as both
+    // server cert AND trust anchor AND client cert — the cert is its
+    // own root, so a chain of one is valid.
+    var server_auth = try common.CertKeyPair.fromSlice(alloc, io, mtls_test_cert_pem, mtls_test_key_pem);
+    defer server_auth.deinit(alloc);
+    var client_auth = try common.CertKeyPair.fromSlice(alloc, io, mtls_test_cert_pem, mtls_test_key_pem);
+    defer client_auth.deinit(alloc);
+    var root_ca = try cert.fromSlice(alloc, io, mtls_test_cert_pem);
+    defer root_ca.deinit(alloc);
+
+    var cli = handshake_client_mod.NonBlock.init(.{
+        .rng = rng,
+        .root_ca = root_ca,
+        .host = "localhost",
+        .insecure_skip_verify = true,
+        .now = now,
+        .auth = &client_auth,
+    });
+    var srv = NonBlock.initWithAllocator(.{
+        .rng = rng,
+        .auth = &server_auth,
+        .now = now,
+        .client_auth = .{
+            .root_ca = root_ca,
+            .auth_type = .require,
+        },
+    }, alloc);
+    defer srv.deinit();
+
+    try driveHandshake(&cli, &srv, 12);
+    try testing.expect(srv.done());
+
+    // THE LIFETIME-FIX ASSERTION: readClientFlight2 has returned. Its
+    // stack-local cleartext_buffer is gone. If the allocator.dupe is
+    // omitted, this slice points at garbage.
+    const peer_der = srv.peerCertificate();
+    try testing.expect(peer_der != null);
+    try testing.expect(peer_der.?.len > 0);
+
+    // Verify the bytes byte-match the leaf cert.
+    var fixture_bundle = try cert.fromSlice(alloc, io, mtls_test_cert_pem);
+    defer fixture_bundle.deinit(alloc);
+    var it = fixture_bundle.map.iterator();
+    const entry = it.next() orelse return error.NoCertInFixture;
+    const offset = entry.value_ptr.*;
+    const outer = try Certificate.der.Element.parse(fixture_bundle.bytes.items, offset);
+    const expected_der = fixture_bundle.bytes.items[offset..outer.slice.end];
+
+    try testing.expect(peer_der.?.ptr != expected_der.ptr); // it's a copy
+    try testing.expectEqualSlices(u8, expected_der, peer_der.?);
+}
+
+test "peerCertificate returns null when no allocator is provided" {
+    // Legacy back-compat: `init(opt)` without an allocator. We use a
+    // server-only handshake (no client_auth) so the allocator-required
+    // assert is not tripped.
+    const alloc = testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const now = std.Io.Clock.real.now(io);
+    const rng_impl: std.Random.IoSource = .{ .io = io };
+    const rng = rng_impl.interface();
+
+    var server_auth = try common.CertKeyPair.fromSlice(alloc, io, mtls_test_cert_pem, mtls_test_key_pem);
+    defer server_auth.deinit(alloc);
+    var root_ca = try cert.fromSlice(alloc, io, mtls_test_cert_pem);
+    defer root_ca.deinit(alloc);
+
+    var cli = handshake_client_mod.NonBlock.init(.{
+        .rng = rng,
+        .root_ca = root_ca,
+        .host = "localhost",
+        .insecure_skip_verify = true,
+        .now = now,
+    });
+    var srv = NonBlock.init(.{
+        .rng = rng,
+        .auth = &server_auth,
+        .now = now,
+    });
+
+    try driveHandshake(&cli, &srv, 12);
+    try testing.expect(srv.done());
+    try testing.expectEqual(@as(?[]const u8, null), srv.peerCertificate());
+}
+
+test "OOM during peer cert dupe aborts handshake with no leak" {
+    const setup_alloc = testing.allocator;
+    var threaded: std.Io.Threaded = .init(setup_alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const now = std.Io.Clock.real.now(io);
+    const rng_impl: std.Random.IoSource = .{ .io = io };
+    const rng = rng_impl.interface();
+
+    var server_auth = try common.CertKeyPair.fromSlice(setup_alloc, io, mtls_test_cert_pem, mtls_test_key_pem);
+    defer server_auth.deinit(setup_alloc);
+    var client_auth = try common.CertKeyPair.fromSlice(setup_alloc, io, mtls_test_cert_pem, mtls_test_key_pem);
+    defer client_auth.deinit(setup_alloc);
+    var root_ca = try cert.fromSlice(setup_alloc, io, mtls_test_cert_pem);
+    defer root_ca.deinit(setup_alloc);
+
+    // FailingAllocator with fail_index=0 → first allocation fails.
+    var failing = std.testing.FailingAllocator.init(setup_alloc, .{ .fail_index = 0 });
+    const oom_alloc = failing.allocator();
+
+    var srv = NonBlock.initWithAllocator(.{
+        .rng = rng,
+        .auth = &server_auth,
+        .now = now,
+        .client_auth = .{
+            .root_ca = root_ca,
+            .auth_type = .require,
+        },
+    }, oom_alloc);
+    defer srv.deinit();
+    var cli = handshake_client_mod.NonBlock.init(.{
+        .rng = rng,
+        .root_ca = root_ca,
+        .host = "localhost",
+        .insecure_skip_verify = true,
+        .now = now,
+        .auth = &client_auth,
+    });
+
+    var cs_buf: [max_ciphertext_record_len]u8 = undefined;
+    var sc_buf: [max_ciphertext_record_len]u8 = undefined;
+    var sc_len: usize = 0;
+    var cs_len: usize = 0;
+    var got_oom = false;
+    var rounds: usize = 0;
+    while (!cli.done() or !srv.done()) : (rounds += 1) {
+        if (rounds > 12) break;
+        if (!cli.done()) {
+            const cr = cli.run(sc_buf[0..sc_len], &cs_buf) catch break;
+            if (cr.recv_pos > 0) {
+                const remaining = sc_len - cr.recv_pos;
+                if (remaining > 0) std.mem.copyForwards(u8, sc_buf[0..remaining], sc_buf[cr.recv_pos..sc_len]);
+                sc_len = remaining;
+            }
+            cs_len = cr.send.len;
+        }
+        if (!srv.done()) {
+            const sr = srv.run(cs_buf[0..cs_len], &sc_buf) catch |e| {
+                if (e == error.OutOfMemory) {
+                    got_oom = true;
+                    break;
+                }
+                return e;
+            };
+            if (sr.recv_pos > 0) {
+                const remaining = cs_len - sr.recv_pos;
+                if (remaining > 0) std.mem.copyForwards(u8, cs_buf[0..remaining], cs_buf[sr.recv_pos..cs_len]);
+                cs_len = remaining;
+            }
+            sc_len = sr.send.len;
+        }
+    }
+
+    try testing.expect(got_oom);
+    try testing.expectEqual(@as(?[]const u8, null), srv.peerCertificate());
+    // No leak — the failed dupe never committed anything through oom_alloc.
+    try testing.expectEqual(failing.allocations, failing.deallocations);
+}
+
+test "chain-depth cap accepts in-bounds chain" {
+    const alloc = testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const now = std.Io.Clock.real.now(io);
+    const rng_impl: std.Random.IoSource = .{ .io = io };
+    const rng = rng_impl.interface();
+
+    var server_auth = try common.CertKeyPair.fromSlice(alloc, io, mtls_test_cert_pem, mtls_test_key_pem);
+    defer server_auth.deinit(alloc);
+    var client_auth = try common.CertKeyPair.fromSlice(alloc, io, mtls_test_cert_pem, mtls_test_key_pem);
+    defer client_auth.deinit(alloc);
+    var root_ca = try cert.fromSlice(alloc, io, mtls_test_cert_pem);
+    defer root_ca.deinit(alloc);
+
+    // max_chain_depth = 4 + client sends 1 cert → loop accepts (1 <= 4).
+    var srv = NonBlock.initWithAllocator(.{
+        .rng = rng,
+        .auth = &server_auth,
+        .now = now,
+        .client_auth = .{
+            .root_ca = root_ca,
+            .auth_type = .require,
+            .max_chain_depth = 4,
+        },
+    }, alloc);
+    defer srv.deinit();
+    var cli = handshake_client_mod.NonBlock.init(.{
+        .rng = rng,
+        .root_ca = root_ca,
+        .host = "localhost",
+        .insecure_skip_verify = true,
+        .now = now,
+        .auth = &client_auth,
+    });
+
+    try driveHandshake(&cli, &srv, 12);
+    try testing.expect(srv.done());
+    try testing.expect(srv.peerCertificate() != null);
+}
+
+// ---------------------------------------------------------------------
+// SNI — sniHost lifetime + awaiting_auth pause + setAuth + rejectNoMatch
+// ---------------------------------------------------------------------
+
+test "sniHost survives across awaiting_auth pause" {
+    const alloc = testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const now = std.Io.Clock.real.now(io);
+    const rng_impl: std.Random.IoSource = .{ .io = io };
+    const rng = rng_impl.interface();
+
+    var server_auth = try common.CertKeyPair.fromSlice(alloc, io, mtls_test_cert_pem, mtls_test_key_pem);
+    defer server_auth.deinit(alloc);
+    var root_ca = try cert.fromSlice(alloc, io, mtls_test_cert_pem);
+    defer root_ca.deinit(alloc);
+
+    const expected_sni = "example.test.local";
+
+    var cli = handshake_client_mod.NonBlock.init(.{
+        .rng = rng,
+        .root_ca = root_ca,
+        .host = expected_sni,
+        .insecure_skip_verify = true,
+        .now = now,
+    });
+    var srv = NonBlock.initForSniDispatch(.{
+        .rng = rng,
+        .auth = null, // resolved via setAuth()
+        .now = now,
+    }, null);
+
+    var cs_buf: [max_ciphertext_record_len]u8 = undefined;
+    var sc_buf: [max_ciphertext_record_len]u8 = undefined;
+    var sc_len: usize = 0;
+    var cs_len: usize = 0;
+
+    // Round 1: client emits ClientHello.
+    const cr1 = try cli.run(&sc_buf, &cs_buf);
+    cs_len = cr1.send.len;
+
+    // Round 2: server consumes ClientHello → should pause at .awaiting_auth.
+    const sr1 = try srv.run(cs_buf[0..cs_len], &sc_buf);
+    try testing.expectEqual(NonBlock.RunState.awaiting_auth, srv.runState());
+    try testing.expectEqual(@as(usize, 0), sr1.send.len);
+
+    // sniHost captured. Snapshot the bytes.
+    const sni_first = srv.sniHost();
+    try testing.expect(sni_first != null);
+    try testing.expectEqualStrings(expected_sni, sni_first.?);
+
+    // Idempotent: calling run() again without resolving should still
+    // report awaiting_auth (the SNI bytes survive even though the input
+    // buffer has been overwritten with zeros from the moveForwards).
+    @memset(cs_buf[0..cs_len], 0); // scribble the input buffer
+    cs_len = 0;
+    const sr2 = try srv.run(&.{}, &sc_buf);
+    try testing.expectEqual(NonBlock.RunState.awaiting_auth, srv.runState());
+    try testing.expectEqual(@as(usize, 0), sr2.send.len);
+
+    // CRITICAL: SNI bytes survive the input-buffer scribble. This is the
+    // load-bearing lifetime test — if `sni_host_buf` were a slice into
+    // the input buffer, this would now point at zeros.
+    const sni_second = srv.sniHost();
+    try testing.expect(sni_second != null);
+    try testing.expectEqualStrings(expected_sni, sni_second.?);
+
+    // Resolve via setAuth, drive to completion.
+    srv.setAuth(&server_auth);
+    try testing.expectEqual(NonBlock.RunState.in_progress, srv.runState());
+
+    var rounds: usize = 0;
+    while (!cli.done() or !srv.done()) : (rounds += 1) {
+        if (rounds > 12) return error.HandshakeTooManyRounds;
+        if (!cli.done()) {
+            const cr = try cli.run(sc_buf[0..sc_len], &cs_buf);
+            if (cr.recv_pos > 0) {
+                const remaining = sc_len - cr.recv_pos;
+                if (remaining > 0) std.mem.copyForwards(u8, sc_buf[0..remaining], sc_buf[cr.recv_pos..sc_len]);
+                sc_len = remaining;
+            }
+            cs_len = cr.send.len;
+        }
+        if (!srv.done()) {
+            const sr = try srv.run(cs_buf[0..cs_len], &sc_buf);
+            if (sr.recv_pos > 0) {
+                const remaining = cs_len - sr.recv_pos;
+                if (remaining > 0) std.mem.copyForwards(u8, cs_buf[0..remaining], cs_buf[sr.recv_pos..cs_len]);
+                cs_len = remaining;
+            }
+            sc_len = sr.send.len;
+        }
+    }
+    try testing.expect(cli.done());
+    try testing.expect(srv.done());
+    // SNI still readable post-handshake.
+    try testing.expectEqualStrings(expected_sni, srv.sniHost().?);
+}
+
+test "setAuth swaps server cert during handshake" {
+    // Two CertKeyPairs — both backed by the same cert/key fixture (we
+    // can't easily build two distinct self-signed P-256 chains in a
+    // pure-Zig test). The test verifies that the cert passed via
+    // setAuth (NOT a hypothetical opt.auth) is the one used; the cipher
+    // succeeds end-to-end.
+    const alloc = testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const now = std.Io.Clock.real.now(io);
+    const rng_impl: std.Random.IoSource = .{ .io = io };
+    const rng = rng_impl.interface();
+
+    var swap_auth = try common.CertKeyPair.fromSlice(alloc, io, mtls_test_cert_pem, mtls_test_key_pem);
+    defer swap_auth.deinit(alloc);
+    var root_ca = try cert.fromSlice(alloc, io, mtls_test_cert_pem);
+    defer root_ca.deinit(alloc);
+
+    var cli = handshake_client_mod.NonBlock.init(.{
+        .rng = rng,
+        .root_ca = root_ca,
+        .host = "localhost",
+        .insecure_skip_verify = true,
+        .now = now,
+    });
+    var srv = NonBlock.initForSniDispatch(.{
+        .rng = rng,
+        .auth = null,
+        .now = now,
+    }, null);
+
+    var cs_buf: [max_ciphertext_record_len]u8 = undefined;
+    var sc_buf: [max_ciphertext_record_len]u8 = undefined;
+    var sc_len: usize = 0;
+    var cs_len: usize = 0;
+
+    // Client emits ClientHello.
+    const cr1 = try cli.run(&sc_buf, &cs_buf);
+    cs_len = cr1.send.len;
+
+    // Server pauses.
+    _ = try srv.run(cs_buf[0..cs_len], &sc_buf);
+    try testing.expectEqual(NonBlock.RunState.awaiting_auth, srv.runState());
+    cs_len = 0;
+
+    // Resolve.
+    srv.setAuth(&swap_auth);
+
+    // Drive to completion.
+    var rounds: usize = 0;
+    while (!cli.done() or !srv.done()) : (rounds += 1) {
+        if (rounds > 12) return error.HandshakeTooManyRounds;
+        if (!cli.done()) {
+            const cr = try cli.run(sc_buf[0..sc_len], &cs_buf);
+            if (cr.recv_pos > 0) {
+                const remaining = sc_len - cr.recv_pos;
+                if (remaining > 0) std.mem.copyForwards(u8, sc_buf[0..remaining], sc_buf[cr.recv_pos..sc_len]);
+                sc_len = remaining;
+            }
+            cs_len = cr.send.len;
+        }
+        if (!srv.done()) {
+            const sr = try srv.run(cs_buf[0..cs_len], &sc_buf);
+            if (sr.recv_pos > 0) {
+                const remaining = cs_len - sr.recv_pos;
+                if (remaining > 0) std.mem.copyForwards(u8, cs_buf[0..remaining], cs_buf[sr.recv_pos..cs_len]);
+                cs_len = remaining;
+            }
+            sc_len = sr.send.len;
+        }
+    }
+    try testing.expect(cli.done());
+    try testing.expect(srv.done());
+    try testing.expect(cli.cipher() != null);
+    try testing.expect(srv.cipher() != null);
+}
+
+test "RFC 6066 unknown NameType stops list parsing" {
+    // Craft a ClientHello manually targeting just readClientHello. We
+    // exercise the SNI parse path by setting up a Handshake struct with
+    // a fixed Reader pointed at a synthesized ClientHello where the
+    // server_name extension starts with a non-host_name NameType.
+    //
+    // The simpler approach: drive a real client handshake (host = "X")
+    // first and capture its bytes, then mutate the captured ClientHello
+    // to flip the first NameType. But this is fragile across lib
+    // changes. Instead we use a direct unit test below.
+
+    // For now, verify the parse logic via a minimal harness. We need a
+    // Handshake instance and an Io.Reader fed a synthesized ClientHello.
+    // Building a fully valid ClientHello is non-trivial — instead we
+    // test the SNI parse logic at the level of the server's response to
+    // a real client: a normal valid handshake should observe SNI when
+    // the client sets host = "test.example.com".
+    const alloc = testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const now = std.Io.Clock.real.now(io);
+    const rng_impl: std.Random.IoSource = .{ .io = io };
+    const rng = rng_impl.interface();
+
+    var server_auth = try common.CertKeyPair.fromSlice(alloc, io, mtls_test_cert_pem, mtls_test_key_pem);
+    defer server_auth.deinit(alloc);
+    var root_ca = try cert.fromSlice(alloc, io, mtls_test_cert_pem);
+    defer root_ca.deinit(alloc);
+
+    // Client driving SNI = "test.example.com" — host_name(0) entry.
+    var cli = handshake_client_mod.NonBlock.init(.{
+        .rng = rng,
+        .root_ca = root_ca,
+        .host = "test.example.com",
+        .insecure_skip_verify = true,
+        .now = now,
+    });
+    var srv = NonBlock.init(.{
+        .rng = rng,
+        .auth = &server_auth,
+        .now = now,
+    });
+
+    var cs_buf: [max_ciphertext_record_len]u8 = undefined;
+    var sc_buf: [max_ciphertext_record_len]u8 = undefined;
+
+    // Client emits ClientHello.
+    const cr = try cli.run(&sc_buf, &cs_buf);
+
+    // Locate the server_name extension in the emitted ClientHello and
+    // flip the NameType byte (offset = first byte of ServerName entry,
+    // immediately after the 2-byte server_name_list length).
+    // Extension type 0x00 0x00; extension len (u16); server_name_list
+    // len (u16); NameType (u8).
+    const cs_emitted = cs_buf[0..cr.send_pos];
+    var i: usize = 0;
+    var found: ?usize = null;
+    while (i + 4 <= cs_emitted.len) : (i += 1) {
+        if (cs_emitted[i] == 0x00 and cs_emitted[i + 1] == 0x00) {
+            // Possibly the server_name extension — verify by computing
+            // expected length: ext_len = host_len + 5.
+            const ext_len = (@as(u16, cs_emitted[i + 2]) << 8) | cs_emitted[i + 3];
+            if (ext_len == "test.example.com".len + 5) {
+                // server_name_list at i+4..; first byte at i+6 is NameType.
+                if (i + 6 < cs_emitted.len) {
+                    found = i + 6;
+                    break;
+                }
+            }
+        }
+    }
+    try testing.expect(found != null);
+
+    // Mutate the NameType from 0 (host_name) → 1 (unknown).
+    cs_buf[found.?] = 1;
+
+    // Server consumes the mutated ClientHello. Our parse should STOP at
+    // the unknown NameType and treat SNI as absent.
+    const sr = try srv.run(cs_buf[0..cr.send_pos], &sc_buf);
+    _ = sr;
+    try testing.expectEqual(@as(?[]const u8, null), srv.sniHost());
+}
+
+test "rejectNoMatch sends unrecognized_name alert" {
+    // Setup: client + SNI-dispatch server; server calls rejectNoMatch
+    // during the awaiting_auth pause; the next run() should raise
+    // TlsUnrecognizedName.
+    const alloc = testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const now = std.Io.Clock.real.now(io);
+    const rng_impl: std.Random.IoSource = .{ .io = io };
+    const rng = rng_impl.interface();
+
+    var root_ca = try cert.fromSlice(alloc, io, mtls_test_cert_pem);
+    defer root_ca.deinit(alloc);
+
+    var cli = handshake_client_mod.NonBlock.init(.{
+        .rng = rng,
+        .root_ca = root_ca,
+        .host = "wont-be-served.example",
+        .insecure_skip_verify = true,
+        .now = now,
+    });
+    var srv = NonBlock.initForSniDispatch(.{
+        .rng = rng,
+        .auth = null,
+        .now = now,
+    }, null);
+
+    var cs_buf: [max_ciphertext_record_len]u8 = undefined;
+    var sc_buf: [max_ciphertext_record_len]u8 = undefined;
+
+    const cr = try cli.run(&sc_buf, &cs_buf);
+    _ = try srv.run(cs_buf[0..cr.send_pos], &sc_buf);
+    try testing.expectEqual(NonBlock.RunState.awaiting_auth, srv.runState());
+
+    srv.rejectNoMatch();
+
+    // Next run() should bubble out TlsUnrecognizedName from serverFlight.
+    try testing.expectError(error.TlsUnrecognizedName, srv.run(&.{}, &sc_buf));
+}
