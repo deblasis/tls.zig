@@ -190,7 +190,12 @@ pub const cert = struct {
 };
 
 pub const CertificateBuilder = struct {
-    cert_key_pair: *CertKeyPair,
+    /// Caller-owned cert/key bundle to serialize. Read-only — the
+    /// builder only inspects bundle bytes + signature schemes; it never
+    /// writes through this pointer. Holding it `*const` lets callers
+    /// share a single `CertKeyPair` between concurrent handshakes
+    /// without copies or const-stripping.
+    cert_key_pair: *const CertKeyPair,
     transcript: *Transcript,
     tls_version: proto.Version = .tls_1_3,
     side: proto.Side = .client,

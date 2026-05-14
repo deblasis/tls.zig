@@ -28,8 +28,9 @@ pub const Options = struct {
     rng: std.Random,
 
     /// Server authentication. If null server will not send Certificate and
-    /// CertificateVerify message.
-    auth: ?*CertKeyPair,
+    /// CertificateVerify message. Pointer is read-only — the library
+    /// never mutates the underlying `CertKeyPair`.
+    auth: ?*const CertKeyPair,
 
     /// If not null server will request client certificate. If auth_type is
     /// .request empty client certificate message will be accepted.
@@ -154,8 +155,9 @@ pub const Handshake = struct {
     /// `serverFlight` reads instead of `opt.auth` directly. Legacy
     /// callers populate this at construction; SNI callers populate via
     /// `setAuth()`. The data behind the pointer is owned by the caller,
-    /// not the library.
-    opt_auth: ?*CertKeyPair = null,
+    /// not the library, and is treated as immutable throughout the
+    /// handshake.
+    opt_auth: ?*const CertKeyPair = null,
 
     /// Set by `rejectNoMatch()`. When true, `serverFlight` raises
     /// `error.TlsUnrecognizedName` before emitting any post-ClientHello
@@ -164,11 +166,13 @@ pub const Handshake = struct {
     /// RFC 6066 §3.
     no_match_abort: bool = false,
 
+    const Self = @This();
+
     /// Accessor for the parsed SNI hostname. Returns null when
     /// sni_host_len == 0 (absent OR malformed); else returns
     /// `sni_host_buf[0..sni_host_len]`. Lifetime = Handshake lifetime
     /// (inline buffer is pinned).
-    pub fn sniHost(self: *const Handshake) ?[]const u8 {
+    pub fn sniHost(self: *const Self) ?[]const u8 {
         if (self.sni_host_len == 0) return null;
         return self.sni_host_buf[0..self.sni_host_len];
     }
@@ -176,11 +180,9 @@ pub const Handshake = struct {
     /// Accessor for the verified peer's leaf DER bytes. Returns null
     /// when the handshake has not captured one. Lifetime equals the
     /// owning `NonBlock.Server` (freed by `deinit`).
-    pub fn peerCertificate(self: *const Handshake) ?[]const u8 {
+    pub fn peerCertificate(self: *const Self) ?[]const u8 {
         return self.peer_cert_der;
     }
-
-    const Self = @This();
 
     fn writeAlert(h: *Self, cph: ?*Cipher, err: anyerror) !void {
         if (cph) |c| {
@@ -874,14 +876,16 @@ pub const NonBlock = struct {
 
     /// Resolve the auth and advance past the `.awaiting_auth` pause.
     /// `cert_key_pair` MUST be a valid pointer; the engine emits
-    /// Certificate using it on the next `run()`. After `setAuth`, the
-    /// post-resolution `signature_scheme` is validated against the
-    /// client's offered `signature_algorithms` list (cached during
-    /// `readClientHello`) — mismatch trips `error.TlsHandshakeFailure`
-    /// on the next `run()`.
+    /// Certificate using it on the next `run()`. The pointee is treated
+    /// as read-only — the library never mutates a `CertKeyPair`, so the
+    /// `*const` lets callers stash a single shared pair in a dispatch
+    /// table behind `*const`. After `setAuth`, the post-resolution
+    /// `signature_scheme` is validated against the client's offered
+    /// `signature_algorithms` list (cached during `readClientHello`) —
+    /// mismatch trips `error.TlsHandshakeFailure` on the next `run()`.
     pub fn setAuth(
         self: *Self,
-        cert_key_pair: *CertKeyPair,
+        cert_key_pair: *const CertKeyPair,
     ) void {
         self.inner.opt_auth = cert_key_pair;
         self.inner.auth_resolved = true;
@@ -1303,7 +1307,7 @@ test "peerCertificate returns null when no allocator is provided" {
 
     try driveHandshake(&cli, &srv, 12);
     try testing.expect(srv.done());
-    try testing.expectEqual(@as(?[]const u8, null), srv.peerCertificate());
+    try testing.expect(srv.peerCertificate() == null);
 }
 
 test "OOM during peer cert dupe aborts handshake with no leak" {
@@ -1380,7 +1384,7 @@ test "OOM during peer cert dupe aborts handshake with no leak" {
     }
 
     try testing.expect(got_oom);
-    try testing.expectEqual(@as(?[]const u8, null), srv.peerCertificate());
+    try testing.expect(srv.peerCertificate() == null);
     // No leak — the failed dupe never committed anything through oom_alloc.
     try testing.expectEqual(failing.allocations, failing.deallocations);
 }
@@ -1686,7 +1690,7 @@ test "RFC 6066 unknown NameType stops list parsing" {
     // the unknown NameType and treat SNI as absent.
     const sr = try srv.run(cs_buf[0..cr.send_pos], &sc_buf);
     _ = sr;
-    try testing.expectEqual(@as(?[]const u8, null), srv.sniHost());
+    try testing.expect(srv.sniHost() == null);
 }
 
 test "rejectNoMatch sends unrecognized_name alert" {
