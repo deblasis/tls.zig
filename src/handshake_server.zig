@@ -53,6 +53,13 @@ pub const ClientAuth = struct {
 
     auth_type: Type = .require,
 
+    /// Defensive cap on cert chain depth. The library will fail-early
+    /// with `error.PeerCertChainTooDeep` if the client's Certificate
+    /// message carries more entries than this cap. Default is 255 (u8
+    /// max, effectively unbounded) to preserve back-compat. Callers
+    /// concerned about pathological chain depth can tighten this.
+    max_chain_depth: u8 = 255,
+
     pub const Type = enum {
         /// Client certificate will be requested during the handshake, but does
         /// not require that the client send any certificates.
@@ -88,6 +95,32 @@ pub const Handshake = struct {
     transcript: Transcript = .{},
     /// ALPN protocol selected during handshake.
     alpn_protocol: ?[]const u8 = null,
+
+    /// Optional allocator used to dupe the verified peer leaf cert DER
+    /// into long-lived memory in `readClientFlight2`. Null = legacy
+    /// behavior (no leaf capture, no allocation). When non-null AND
+    /// `opt.client_auth` is configured AND the peer presents a non-empty
+    /// cert, the leaf bytes are duped on success; the copy lifetime
+    /// equals `NonBlock.Server` lifetime (deinit frees).
+    allocator: ?std.mem.Allocator = null,
+
+    /// Allocator-owned copy of the verified peer's leaf certificate
+    /// DER. Populated on successful mTLS handshake when
+    /// `allocator != null`; freed by `NonBlock.Server.deinit`. Null in
+    /// these cases:
+    ///   - allocator is null (legacy path),
+    ///   - mTLS not configured (`opt.client_auth == null`),
+    ///   - client presented an empty Certificate message in `.request` mode,
+    ///   - handshake has not reached the certificate flight yet,
+    ///   - OOM during dupe (handshake aborts with `error.OutOfMemory`).
+    peer_cert_der: ?[]const u8 = null,
+
+    /// Accessor for the verified peer's leaf DER bytes. Returns null
+    /// when the handshake has not captured one. Lifetime equals the
+    /// owning `NonBlock.Server` (freed by `deinit`).
+    pub fn peerCertificate(self: *const Handshake) ?[]const u8 {
+        return self.peer_cert_der;
+    }
 
     const Self = @This();
 
@@ -238,10 +271,19 @@ pub const Handshake = struct {
         var handshake_state: proto.Handshake = .finished;
         var crt_parser: CertificateParser = undefined;
         if (opt.client_auth) |client_auth| {
+            // Close the allocator-optional footgun: if a caller
+            // configured `Options.client_auth` but constructed the
+            // server via the legacy no-allocator `init`, post-handshake
+            // cert capture would silently no-op. Fail loudly in debug
+            // builds so misuse surfaces at handshake time, not via a
+            // confusing `peerCertificate() == null` downstream.
+            std.debug.assert(h.allocator != null);
             crt_parser = .{
                 .root_ca = client_auth.root_ca,
                 .host = "",
                 .now_sec = opt.now.toSeconds(),
+                // Propagate the defensive chain-depth cap.
+                .max_chain_depth = client_auth.max_chain_depth,
             };
             handshake_state = .certificate;
         }
@@ -289,6 +331,20 @@ pub const Handshake = struct {
                                     handshake_state = .finished;
                                 } else {
                                     try crt_parser.parseCertificate(&d, .tls_1_3);
+                                    // Copy the verified leaf DER into
+                                    // allocator-owned memory BEFORE the
+                                    // stack-local cleartext_buffer (and
+                                    // therefore crt_parser.leaf_der) goes
+                                    // out of scope. On OOM the handshake
+                                    // aborts; `peer_cert_der` stays null
+                                    // and the connection tears down
+                                    // cleanly via the engine's existing
+                                    // alert-from-error machinery.
+                                    if (h.allocator) |alloc| {
+                                        if (crt_parser.leaf_der) |leaf| {
+                                            h.peer_cert_der = try alloc.dupe(u8, leaf);
+                                        }
+                                    }
                                     handshake_state = .certificate_verify;
                                 }
                             },
@@ -604,9 +660,25 @@ pub const NonBlock = struct {
     };
 
     pub fn init(opt: Options) Self {
+        // Back-compat entry point. No allocator → no leaf DER capture.
+        // All pre-mTLS-capture callers continue to compile and run
+        // bit-identically against this overload.
+        return initWithAllocator(opt, null);
+    }
+
+    /// Allocator-aware constructor. When `allocator` is non-null AND
+    /// `opt.client_auth` is non-null, the engine captures the verified
+    /// peer's leaf certificate DER into allocator-owned memory during
+    /// `readClientFlight2`. The copy is freed by `deinit`. Callers
+    /// retrieve it via `peerCertificate()` after `done()` returns true.
+    ///
+    /// Passing `null` is equivalent to calling `init` — no leaf capture,
+    /// no allocation.
+    pub fn initWithAllocator(opt: Options, allocator: ?std.mem.Allocator) Self {
         var inner: Handshake = .{
             .input = undefined,
             .output = undefined,
+            .allocator = allocator,
         };
         inner.initKeys(opt);
         return .{
@@ -614,6 +686,37 @@ pub const NonBlock = struct {
             .inner = inner,
             .state = .init,
         };
+    }
+
+    /// Release the allocator-owned leaf DER copy if one was captured.
+    /// Safe to call when no copy was made (null check). Safe to call
+    /// multiple times: clears `peer_cert_der` after free. Calling on a
+    /// no-allocator instance is a no-op.
+    pub fn deinit(self: *Self) void {
+        if (self.inner.peer_cert_der) |bytes| {
+            // Allocator MUST be non-null if we have an owned copy — the
+            // copy is created inside the same `if (h.allocator)` guard
+            // in readClientFlight2. Defensive unwrap.
+            if (self.inner.allocator) |alloc| {
+                alloc.free(bytes);
+            }
+            self.inner.peer_cert_der = null;
+        }
+    }
+
+    /// Accessor for the verified peer's leaf DER bytes. Returns null in
+    /// these cases:
+    ///   - handshake has not yet completed (`done() == false`),
+    ///   - allocator was null at construction (back-compat path),
+    ///   - mTLS not configured (`opt.client_auth == null`),
+    ///   - client presented an empty Certificate in `.request` mode.
+    ///
+    /// The returned slice is owned by this `NonBlock.Server`; lifetime
+    /// equals server lifetime (freed by `deinit`). Callers that need
+    /// longer retention MUST copy into their own storage.
+    pub fn peerCertificate(self: Self) ?[]const u8 {
+        if (!self.done()) return null;
+        return self.inner.peer_cert_der;
     }
 
     fn recv(self: *Self) !void {

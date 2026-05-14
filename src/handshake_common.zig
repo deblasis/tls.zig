@@ -307,6 +307,23 @@ pub const CertificateParser = struct {
     skip_verify: bool = false,
     now_sec: i64,
 
+    /// Slice of the first (leaf) certificate observed during
+    /// `parseCertificate`. Points into the caller-provided record buffer,
+    /// so it is VALID ONLY UNTIL `parseCertificate` returns. Callers that
+    /// wish to retain the bytes MUST copy into long-lived storage before
+    /// the borrowed buffer's lifetime ends.
+    leaf_der: ?[]const u8 = null,
+
+    /// Defensive cap on the number of certs we'll walk in the peer's
+    /// Certificate message. Defaults to 255 (u8 max, effectively
+    /// unbounded). Callers configuring tighter caps trade compatibility
+    /// with deeply-nested chains for fail-early protection.
+    max_chain_depth: u8 = 255,
+
+    /// Count of certificates parsed so far in `parseCertificate`. Used
+    /// to enforce `max_chain_depth`.
+    cert_count: u8 = 0,
+
     pub fn parseCertificate(h: *CertificateParser, d: *record.Decoder, tls_version: proto.Version) !void {
         if (tls_version == .tls_1_3) {
             const request_context = try d.decode(u8);
@@ -318,12 +335,24 @@ pub const CertificateParser = struct {
         const certs_len = try d.decode(u24);
         const start_idx = d.idx;
         while (d.idx - start_idx < certs_len) {
+            // Chain-depth cap. Fail early during the DER walk if the
+            // peer's chain exceeds the configured limit.
+            if (h.cert_count == h.max_chain_depth) return error.PeerCertChainTooDeep;
+            h.cert_count += 1;
+
             const crt_len = try d.decode(u24);
             const crt = try d.slice(crt_len);
             if (tls_version == .tls_1_3) {
                 // certificate extensions present in tls 1.3
                 try d.skip(try d.decode(u16));
             }
+
+            // Record the leaf DER on the first cert. The slice points
+            // into the caller-owned record buffer; the caller must copy
+            // into long-lived memory before that buffer goes out of
+            // scope if they want to retain the bytes.
+            if (h.leaf_der == null) h.leaf_der = crt;
+
             if (trust_chain_established)
                 continue;
 
