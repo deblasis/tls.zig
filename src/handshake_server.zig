@@ -1283,7 +1283,6 @@ const mtls_test_key_pem = @embedFile("testdata/mtls_test_key.pem");
 const mtls_chain_root_pem = @embedFile("testdata/mtls_chain_root_cert.pem");
 const mtls_chain_leaf_pem = @embedFile("testdata/mtls_chain_leaf_cert.pem");
 const mtls_chain_leaf_key_pem = @embedFile("testdata/mtls_chain_leaf_key.pem");
-const mtls_chain_intermediate_pem = @embedFile("testdata/mtls_chain_intermediate_cert.pem");
 
 const max_ciphertext_record_len = @import("cipher.zig").max_ciphertext_record_len;
 
@@ -1661,8 +1660,7 @@ test "peerChain with retain_chain on + 2-cert chain returns leaf-first ordering"
     // chain[1] MUST be the intermediate.
     //
     // The fixture was generated via openssl per docs/phase-1b.19-*/plan.md
-    // Task 3 step 1. See the comment block at the top of
-    // mtls_chain_leaf_cert.pem for the openssl command line.
+    // Task 3 step 1.
     const alloc = testing.allocator;
     var threaded: std.Io.Threaded = .init(alloc, .{});
     defer threaded.deinit();
