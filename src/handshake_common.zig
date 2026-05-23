@@ -319,6 +319,23 @@ pub const CertificateParser = struct {
     /// the borrowed buffer's lifetime ends.
     leaf_der: ?[]const u8 = null,
 
+    /// Phase 1b.19 — caller-provided backing storage for per-cert DER
+    /// slices observed during `parseCertificate`. When non-null, the
+    /// parser fills entries `[0..cert_count]` with slices pointing into
+    /// the caller-provided record buffer; same lifetime contract as
+    /// `leaf_der` (VALID ONLY UNTIL `parseCertificate` returns). Callers
+    /// retaining the bytes MUST copy into long-lived storage before
+    /// that buffer goes out of scope.
+    ///
+    /// Pass a slice into a stack-allocated `[max_chain_depth]?[]const u8`
+    /// array sized to the configured cap. Storage is filled at indices
+    /// `[0..cert_count]`; entries past `cert_count` stay at their
+    /// pre-call value (callers should initialize the array to `null`).
+    ///
+    /// Optional: null = parse leaf only (back-compat with pre-1b.19
+    /// callers; `leaf_der` still gets populated as before).
+    chain_der_storage: ?[]?[]const u8 = null,
+
     /// Defensive cap on the number of certs we'll walk in the peer's
     /// Certificate message. Defaults to 255 (u8 max, effectively
     /// unbounded). Callers configuring tighter caps trade compatibility
@@ -357,6 +374,19 @@ pub const CertificateParser = struct {
             // into long-lived memory before that buffer goes out of
             // scope if they want to retain the bytes.
             if (h.leaf_der == null) h.leaf_der = crt;
+
+            // Phase 1b.19 — also record into caller-provided chain
+            // storage when configured. `cert_count` was just
+            // incremented to N for the Nth cert (1-based) above; store
+            // at index N-1. Same lifetime contract as `leaf_der`.
+            //
+            // Storage is sized to `max_chain_depth` by the caller; the
+            // chain-depth cap check at the top of this loop ensures we
+            // never index past that bound.
+            if (h.chain_der_storage) |storage| {
+                const idx: usize = @intCast(h.cert_count - 1);
+                if (idx < storage.len) storage[idx] = crt;
+            }
 
             if (trust_chain_established)
                 continue;
@@ -591,4 +621,143 @@ test "DhKeyPair.x25519" {
     );
     var kp = try DhKeyPair.init(seed, &.{.x25519});
     try testing.expectEqualSlices(u8, expected, try kp.sharedKey(.x25519, server_pub_key));
+}
+
+test "CertificateParser: chain_der_storage captures every cert slice in order" {
+    // Drives parseCertificate directly with a hand-built record.Decoder
+    // containing 3 concatenated copies of the same self-signed leaf DER.
+    // skip_verify = true bypasses the chain-walk verify step (each cert
+    // would otherwise fail with IssuerMismatch against itself); the
+    // chain_der_storage capture happens BEFORE the verify gate so this
+    // test pins the storage shape without needing a real multi-cert
+    // chain fixture.
+    //
+    // The companion 3-cert end-to-end test (real handshake with real
+    // chain) lives in handshake_server.zig — this one isolates the
+    // CertificateParser surface.
+    const alloc = testing.allocator;
+    const cert_pem = @embedFile("testdata/mtls_test_cert.pem");
+
+    // Extract the leaf DER from the PEM fixture via cert.fromSlice.
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var bundle = try cert.fromSlice(alloc, io, cert_pem);
+    defer bundle.deinit(alloc);
+
+    var it = bundle.map.iterator();
+    const entry = it.next() orelse return error.NoCertInFixture;
+    const offset = entry.value_ptr.*;
+    const outer = try Certificate.der.Element.parse(bundle.bytes.items, offset);
+    const leaf_der = bundle.bytes.items[offset..outer.slice.end];
+
+    // Hand-build a record.Decoder buffer for the post-record-header
+    // bytes parseCertificate consumes: u8 request_context (0 for tls
+    // 1.3 server-flight Certificate message), u24 certs_len, then for
+    // each cert: u24 crt_len, crt bytes, u16 extensions_len (0 for tls
+    // 1.3).
+    const n_certs = 3;
+    const per_cert_overhead = 3 + 2; // u24 crt_len + u16 extensions_len
+    const certs_len: u24 = @intCast((leaf_der.len + per_cert_overhead) * n_certs);
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(alloc);
+    // u8 request_context (tls 1.3): must be 0 in server flight.
+    try buf.append(alloc, 0);
+    // certs_len header
+    try buf.append(alloc, @intCast((certs_len >> 16) & 0xff));
+    try buf.append(alloc, @intCast((certs_len >> 8) & 0xff));
+    try buf.append(alloc, @intCast(certs_len & 0xff));
+    var i: usize = 0;
+    while (i < n_certs) : (i += 1) {
+        const cl: u24 = @intCast(leaf_der.len);
+        try buf.append(alloc, @intCast((cl >> 16) & 0xff));
+        try buf.append(alloc, @intCast((cl >> 8) & 0xff));
+        try buf.append(alloc, @intCast(cl & 0xff));
+        try buf.appendSlice(alloc, leaf_der);
+        try buf.append(alloc, 0); // extensions_len high byte
+        try buf.append(alloc, 0); // extensions_len low byte
+    }
+
+    var dec: record.Decoder = .init(.handshake, buf.items);
+    var root_ca = try cert.fromSlice(alloc, io, cert_pem);
+    defer root_ca.deinit(alloc);
+
+    var storage: [4]?[]const u8 = .{ null, null, null, null };
+    var parser: CertificateParser = .{
+        .root_ca = root_ca,
+        .host = "",
+        .skip_verify = true,
+        .now_sec = std.Io.Clock.real.now(io).toSeconds(),
+        .chain_der_storage = storage[0..],
+    };
+
+    try parser.parseCertificate(&dec, .tls_1_3);
+
+    try testing.expectEqual(@as(u8, 3), parser.cert_count);
+    try testing.expect(parser.leaf_der != null);
+    try testing.expectEqualSlices(u8, leaf_der, parser.leaf_der.?);
+
+    // chain_der_storage[0..2] must each hold the same DER (leaf-first
+    // ordering is universal; this is the load-bearing assertion).
+    try testing.expect(storage[0] != null);
+    try testing.expect(storage[1] != null);
+    try testing.expect(storage[2] != null);
+    try testing.expectEqual(@as(?[]const u8, null), storage[3]); // unused slot
+    try testing.expectEqualSlices(u8, leaf_der, storage[0].?);
+    try testing.expectEqualSlices(u8, leaf_der, storage[1].?);
+    try testing.expectEqualSlices(u8, leaf_der, storage[2].?);
+}
+
+test "CertificateParser: chain_der_storage null preserves back-compat (no capture)" {
+    // When chain_der_storage is null, parseCertificate behaves exactly
+    // as before 1b.19 — leaf_der captured, chain not. Pins the
+    // back-compat contract for pre-1b.19 callers.
+    const alloc = testing.allocator;
+    const cert_pem = @embedFile("testdata/mtls_test_cert.pem");
+
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var bundle = try cert.fromSlice(alloc, io, cert_pem);
+    defer bundle.deinit(alloc);
+
+    var it = bundle.map.iterator();
+    const entry = it.next() orelse return error.NoCertInFixture;
+    const offset = entry.value_ptr.*;
+    const outer = try Certificate.der.Element.parse(bundle.bytes.items, offset);
+    const leaf_der = bundle.bytes.items[offset..outer.slice.end];
+
+    const certs_len: u24 = @intCast(leaf_der.len + 5);
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(alloc);
+    // u8 request_context (tls 1.3): must be 0 in server flight.
+    try buf.append(alloc, 0);
+    try buf.append(alloc, @intCast((certs_len >> 16) & 0xff));
+    try buf.append(alloc, @intCast((certs_len >> 8) & 0xff));
+    try buf.append(alloc, @intCast(certs_len & 0xff));
+    const cl: u24 = @intCast(leaf_der.len);
+    try buf.append(alloc, @intCast((cl >> 16) & 0xff));
+    try buf.append(alloc, @intCast((cl >> 8) & 0xff));
+    try buf.append(alloc, @intCast(cl & 0xff));
+    try buf.appendSlice(alloc, leaf_der);
+    try buf.append(alloc, 0);
+    try buf.append(alloc, 0);
+
+    var dec: record.Decoder = .init(.handshake, buf.items);
+    var root_ca = try cert.fromSlice(alloc, io, cert_pem);
+    defer root_ca.deinit(alloc);
+
+    var parser: CertificateParser = .{
+        .root_ca = root_ca,
+        .host = "",
+        .skip_verify = true,
+        .now_sec = std.Io.Clock.real.now(io).toSeconds(),
+        // chain_der_storage left null
+    };
+
+    try parser.parseCertificate(&dec, .tls_1_3);
+    try testing.expectEqual(@as(u8, 1), parser.cert_count);
+    try testing.expect(parser.leaf_der != null);
+    // No storage was provided → no per-slice capture happened.
+    try testing.expectEqual(@as(?[]?[]const u8, null), parser.chain_der_storage);
 }
