@@ -61,6 +61,18 @@ pub const ClientAuth = struct {
     /// concerned about pathological chain depth can tighten this.
     max_chain_depth: u8 = 255,
 
+    /// Phase 1b.19 — when true, the engine duplicates each verified
+    /// chain cert's DER bytes into long-lived allocator-owned storage
+    /// on the `NonBlock.Server`, surfaced via `peerChain()`. Default
+    /// false preserves the pre-1b.19 bench profile (no extra
+    /// allocations per handshake).
+    ///
+    /// Requires `Handshake.allocator` to be non-null (i.e., the server
+    /// was constructed via `initWithAllocator` / `initForSniDispatch`).
+    /// Otherwise this flag is silently ignored — same as `peer_cert_der`
+    /// is silently null on a no-allocator instance.
+    retain_chain: bool = false,
+
     pub const Type = enum {
         /// Client certificate will be requested during the handshake, but does
         /// not require that the client send any certificates.
@@ -115,6 +127,18 @@ pub const Handshake = struct {
     ///   - handshake has not reached the certificate flight yet,
     ///   - OOM during dupe (handshake aborts with `error.OutOfMemory`).
     peer_cert_der: ?[]const u8 = null,
+
+    /// Phase 1b.19 — allocator-owned copy of the verified peer's full
+    /// chain DER bytes (leaf at index 0, intermediates after — matches
+    /// the RFC 8446 §4.4.2 wire order). Populated by `readClientFlight2`
+    /// when `allocator != null` AND `opt.client_auth.?.retain_chain ==
+    /// true` AND the peer presented a non-empty cert. Null in all other
+    /// cases (mirrors `peer_cert_der`'s null contract).
+    ///
+    /// Each element is its own `allocator.dupe`'d copy; the slice-of-
+    /// slices is itself allocator-owned. Freed in
+    /// `NonBlock.Server.deinit`.
+    peer_chain_der: ?[]const []const u8 = null,
 
     /// Inline storage for the parsed SNI hostname. 256 bytes is the
     /// round-number safety margin over RFC 5890's 253-octet DNS hostname
@@ -182,6 +206,14 @@ pub const Handshake = struct {
     /// owning `NonBlock.Server` (freed by `deinit`).
     pub fn peerCertificate(self: *const Self) ?[]const u8 {
         return self.peer_cert_der;
+    }
+
+    /// Accessor for the verified peer's full chain DER bytes (leaf at
+    /// index 0). Returns null when no chain was captured (allocator
+    /// null, mTLS off, empty cert flight, OR `retain_chain` off).
+    /// Lifetime equals the owning `NonBlock.Server` (freed by `deinit`).
+    pub fn peerChain(self: *const Self) ?[]const []const u8 {
+        return self.peer_chain_der;
     }
 
     fn writeAlert(h: *Self, cph: ?*Cipher, err: anyerror) !void {
@@ -392,6 +424,28 @@ pub const Handshake = struct {
             handshake_state = .certificate;
         }
 
+        // Phase 1b.19 — caller-owned stack storage for chain DER slices,
+        // sized to the chain-depth cap. The parser fills entries
+        // [0..cert_count) inside parseCertificate; the alloc block in
+        // the .certificate handler below dupes each into long-lived
+        // memory before this stack frame exits.
+        //
+        // Sized to u8 max (255) — the absolute upper bound of
+        // `max_chain_depth` since it's a u8 field. Worst case is
+        // `255 * @sizeOf(?[]const u8) = 255 * 16 = 4 KiB` of stack.
+        // Acceptable for a function-local buffer.
+        //
+        // Initialized to all-null so the dupe loop can detect "this
+        // index was never filled" via `orelse return error.TlsInternalError`
+        // (defensive; should never trip if parseCertificate's loop is
+        // correct).
+        var chain_storage_array: [255]?[]const u8 = .{null} ** 255;
+        if (opt.client_auth) |client_auth| {
+            if (client_auth.retain_chain) {
+                crt_parser.chain_der_storage = chain_storage_array[0..client_auth.max_chain_depth];
+            }
+        }
+
         outer: while (true) {
             const rec = try Record.read(h.input);
             if (rec.protocol_version != .tls_1_2 and rec.content_type != .alert)
@@ -447,6 +501,41 @@ pub const Handshake = struct {
                                     if (h.allocator) |alloc| {
                                         if (crt_parser.leaf_der) |leaf| {
                                             h.peer_cert_der = try alloc.dupe(u8, leaf);
+                                        }
+                                        // Phase 1b.19 — additionally dupe
+                                        // the full chain when retain_chain
+                                        // is set. The storage array on
+                                        // crt_parser was filled by
+                                        // parseCertificate at indices
+                                        // [0..cert_count); each entry is
+                                        // a slice into the about-to-die
+                                        // cleartext_buffer, so we MUST
+                                        // dupe before exiting this scope.
+                                        //
+                                        // OOM partway through frees what
+                                        // we've duped so far via the
+                                        // errdefer chain; deinit then
+                                        // sees `peer_chain_der == null`
+                                        // and the partial-leaf branch
+                                        // above is the only state that
+                                        // persists. The engine teardown
+                                        // surfaces error.OutOfMemory.
+                                        if (opt.client_auth.?.retain_chain) {
+                                            const slot_count: usize = crt_parser.cert_count;
+                                            if (slot_count > 0) {
+                                                const owned = try alloc.alloc([]const u8, slot_count);
+                                                errdefer alloc.free(owned);
+                                                var filled: usize = 0;
+                                                errdefer for (owned[0..filled]) |bytes| alloc.free(bytes);
+                                                const storage = crt_parser.chain_der_storage orelse unreachable;
+                                                var ci: usize = 0;
+                                                while (ci < slot_count) : (ci += 1) {
+                                                    const slice = storage[ci] orelse return error.TlsInternalError;
+                                                    owned[ci] = try alloc.dupe(u8, slice);
+                                                    filled += 1;
+                                                }
+                                                h.peer_chain_der = owned;
+                                            }
                                         }
                                     }
                                     handshake_state = .certificate_verify;
@@ -977,16 +1066,28 @@ pub const NonBlock = struct {
     /// multiple times: clears `peer_cert_der` after free. Calling on a
     /// no-allocator instance is a no-op.
     pub fn deinit(self: *Self) void {
-        const bytes = self.inner.peer_cert_der orelse return;
-        // Allocator MUST be non-null if we have an owned copy — the
-        // copy is created inside the same `if (h.allocator)` guard
-        // in readClientFlight2. Defensive unwrap.
+        // Allocator MUST be non-null if we have an owned copy — both
+        // peer_cert_der and peer_chain_der are populated inside the
+        // same `if (h.allocator)` guard in readClientFlight2. If the
+        // allocator field is unexpectedly null but a copy exists, null
+        // the field so subsequent calls are no-ops.
         const alloc = self.inner.allocator orelse {
             self.inner.peer_cert_der = null;
+            self.inner.peer_chain_der = null;
             return;
         };
-        alloc.free(bytes);
-        self.inner.peer_cert_der = null;
+        if (self.inner.peer_cert_der) |bytes| {
+            alloc.free(bytes);
+            self.inner.peer_cert_der = null;
+        }
+        // Phase 1b.19 — free the chain slices + the slice-of-slices
+        // when retain_chain populated it. Each entry is its own dupe;
+        // the slice-of-slices is its own allocator.alloc.
+        if (self.inner.peer_chain_der) |chain| {
+            for (chain) |bytes| alloc.free(bytes);
+            alloc.free(chain);
+            self.inner.peer_chain_der = null;
+        }
     }
 
     /// Accessor for the verified peer's leaf DER bytes. Returns null in
@@ -1002,6 +1103,21 @@ pub const NonBlock = struct {
     pub fn peerCertificate(self: *const Self) ?[]const u8 {
         if (!self.done()) return null;
         return self.inner.peerCertificate();
+    }
+
+    /// Phase 1b.19 — accessor for the verified peer's full chain DER
+    /// bytes (leaf at index 0). Returns null when:
+    ///   - handshake has not yet completed (`done() == false`),
+    ///   - allocator was null at construction,
+    ///   - mTLS not configured,
+    ///   - client presented an empty Certificate flight in `.request`
+    ///     mode,
+    ///   - `Options.client_auth.?.retain_chain` was false.
+    ///
+    /// Lifetime equals the owning `NonBlock.Server` (freed by `deinit`).
+    pub fn peerChain(self: *const Self) ?[]const []const u8 {
+        if (!self.done()) return null;
+        return self.inner.peerChain();
     }
 
     /// Accessor for the parsed SNI hostname from the client's
