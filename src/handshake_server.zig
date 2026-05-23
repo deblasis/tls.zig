@@ -1280,6 +1280,10 @@ const handshake_client_mod = @import("handshake_client.zig");
 
 const mtls_test_cert_pem = @embedFile("testdata/mtls_test_cert.pem");
 const mtls_test_key_pem = @embedFile("testdata/mtls_test_key.pem");
+const mtls_chain_root_pem = @embedFile("testdata/mtls_chain_root_cert.pem");
+const mtls_chain_leaf_pem = @embedFile("testdata/mtls_chain_leaf_cert.pem");
+const mtls_chain_leaf_key_pem = @embedFile("testdata/mtls_chain_leaf_key.pem");
+const mtls_chain_intermediate_pem = @embedFile("testdata/mtls_chain_intermediate_cert.pem");
 
 const max_ciphertext_record_len = @import("cipher.zig").max_ciphertext_record_len;
 
@@ -1545,6 +1549,239 @@ test "chain-depth cap accepts in-bounds chain" {
     try driveHandshake(&cli, &srv, 12);
     try testing.expect(srv.done());
     try testing.expect(srv.peerCertificate() != null);
+}
+
+// ---------------------------------------------------------------------
+// Phase 1b.19 — chain bytes retention (retain_chain opt-in)
+// ---------------------------------------------------------------------
+
+test "peerChain returns null when retain_chain is off (default)" {
+    // Bit-identical pre-1b.19 path verification. mTLS .require with the
+    // default retain_chain=false → peerChain() stays null even though
+    // peerCertificate() is populated.
+    const alloc = testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const now = std.Io.Clock.real.now(io);
+    const rng_impl: std.Random.IoSource = .{ .io = io };
+    const rng = rng_impl.interface();
+
+    var server_auth = try common.CertKeyPair.fromSlice(alloc, io, mtls_test_cert_pem, mtls_test_key_pem);
+    defer server_auth.deinit(alloc);
+    var client_auth = try common.CertKeyPair.fromSlice(alloc, io, mtls_test_cert_pem, mtls_test_key_pem);
+    defer client_auth.deinit(alloc);
+    var root_ca = try cert.fromSlice(alloc, io, mtls_test_cert_pem);
+    defer root_ca.deinit(alloc);
+
+    var srv = NonBlock.initWithAllocator(.{
+        .rng = rng,
+        .auth = &server_auth,
+        .now = now,
+        .client_auth = .{
+            .root_ca = root_ca,
+            .auth_type = .require,
+            // retain_chain omitted → defaults to false
+        },
+    }, alloc);
+    defer srv.deinit();
+    var cli = handshake_client_mod.NonBlock.init(.{
+        .rng = rng,
+        .root_ca = root_ca,
+        .host = "localhost",
+        .insecure_skip_verify = true,
+        .now = now,
+        .auth = &client_auth,
+    });
+
+    try driveHandshake(&cli, &srv, 12);
+    try testing.expect(srv.done());
+    try testing.expect(srv.peerCertificate() != null); // 1b.13 still works
+    try testing.expect(srv.peerChain() == null); // 1b.19 default
+}
+
+test "peerChain with retain_chain on + 1-cert chain returns single-entry slice == leaf" {
+    // Sanity-check the byte-identity contract when only the leaf is in
+    // play (self-signed test cert reused as cert+root). The returned
+    // slice MUST have length 1 and the first entry MUST byte-match
+    // peerCertificate().
+    const alloc = testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const now = std.Io.Clock.real.now(io);
+    const rng_impl: std.Random.IoSource = .{ .io = io };
+    const rng = rng_impl.interface();
+
+    var server_auth = try common.CertKeyPair.fromSlice(alloc, io, mtls_test_cert_pem, mtls_test_key_pem);
+    defer server_auth.deinit(alloc);
+    var client_auth = try common.CertKeyPair.fromSlice(alloc, io, mtls_test_cert_pem, mtls_test_key_pem);
+    defer client_auth.deinit(alloc);
+    var root_ca = try cert.fromSlice(alloc, io, mtls_test_cert_pem);
+    defer root_ca.deinit(alloc);
+
+    var srv = NonBlock.initWithAllocator(.{
+        .rng = rng,
+        .auth = &server_auth,
+        .now = now,
+        .client_auth = .{
+            .root_ca = root_ca,
+            .auth_type = .require,
+            .retain_chain = true,
+        },
+    }, alloc);
+    defer srv.deinit();
+    var cli = handshake_client_mod.NonBlock.init(.{
+        .rng = rng,
+        .root_ca = root_ca,
+        .host = "localhost",
+        .insecure_skip_verify = true,
+        .now = now,
+        .auth = &client_auth,
+    });
+
+    try driveHandshake(&cli, &srv, 12);
+    try testing.expect(srv.done());
+
+    const chain = srv.peerChain();
+    try testing.expect(chain != null);
+    try testing.expectEqual(@as(usize, 1), chain.?.len);
+
+    const leaf = srv.peerCertificate().?;
+    try testing.expectEqualSlices(u8, leaf, chain.?[0]);
+    // It's a copy — different pointer from peerCertificate.
+    try testing.expect(chain.?[0].ptr != leaf.ptr);
+}
+
+test "peerChain with retain_chain on + 2-cert chain returns leaf-first ordering" {
+    // The load-bearing multi-cert test. Client presents leaf +
+    // intermediate (concatenated in mtls_chain_leaf_cert.pem); server
+    // trust-anchors at root. Server's peerChain() MUST return 2
+    // entries; chain[0] MUST be the leaf cert (matching peerCertificate),
+    // chain[1] MUST be the intermediate.
+    //
+    // The fixture was generated via openssl per docs/phase-1b.19-*/plan.md
+    // Task 3 step 1. See the comment block at the top of
+    // mtls_chain_leaf_cert.pem for the openssl command line.
+    const alloc = testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const now = std.Io.Clock.real.now(io);
+    const rng_impl: std.Random.IoSource = .{ .io = io };
+    const rng = rng_impl.interface();
+
+    // Server uses the existing self-signed cert; trust anchor is the
+    // chain's root (mtls_chain_root_cert.pem). Client cert is the
+    // leaf+intermediate bundle; client's private key signs
+    // CertificateVerify.
+    var server_auth = try common.CertKeyPair.fromSlice(alloc, io, mtls_test_cert_pem, mtls_test_key_pem);
+    defer server_auth.deinit(alloc);
+    var client_auth = try common.CertKeyPair.fromSlice(alloc, io, mtls_chain_leaf_pem, mtls_chain_leaf_key_pem);
+    defer client_auth.deinit(alloc);
+    var server_root = try cert.fromSlice(alloc, io, mtls_chain_root_pem);
+    defer server_root.deinit(alloc);
+    var client_root = try cert.fromSlice(alloc, io, mtls_test_cert_pem);
+    defer client_root.deinit(alloc);
+
+    var srv = NonBlock.initWithAllocator(.{
+        .rng = rng,
+        .auth = &server_auth,
+        .now = now,
+        .client_auth = .{
+            .root_ca = server_root,
+            .auth_type = .require,
+            .max_chain_depth = 4,
+            .retain_chain = true,
+        },
+    }, alloc);
+    defer srv.deinit();
+    var cli = handshake_client_mod.NonBlock.init(.{
+        .rng = rng,
+        .root_ca = client_root,
+        .host = "localhost",
+        .insecure_skip_verify = true,
+        .now = now,
+        .auth = &client_auth,
+    });
+
+    try driveHandshake(&cli, &srv, 12);
+    try testing.expect(srv.done());
+
+    const chain = srv.peerChain();
+    try testing.expect(chain != null);
+    try testing.expectEqual(@as(usize, 2), chain.?.len);
+
+    // Extract the expected leaf + intermediate DER from the fixture for
+    // byte-identity comparison. `Bundle.map` is a `HashMapUnmanaged`, so
+    // iteration order is NOT guaranteed — sort the offsets ascending
+    // before parsing. `Bundle.fromSlice` appends DER bytes in PEM order
+    // (top-down), so the smaller offset is the leaf and the larger is
+    // the intermediate.
+    var fixture_bundle = try cert.fromSlice(alloc, io, mtls_chain_leaf_pem);
+    defer fixture_bundle.deinit(alloc);
+    try testing.expectEqual(@as(u32, 2), fixture_bundle.map.size);
+    var offsets: [2]u32 = undefined;
+    var n: usize = 0;
+    var it = fixture_bundle.map.iterator();
+    while (it.next()) |e| : (n += 1) {
+        offsets[n] = e.value_ptr.*;
+    }
+    if (offsets[0] > offsets[1]) std.mem.swap(u32, &offsets[0], &offsets[1]);
+    const o0 = try Certificate.der.Element.parse(fixture_bundle.bytes.items, offsets[0]);
+    const o1 = try Certificate.der.Element.parse(fixture_bundle.bytes.items, offsets[1]);
+    const expected_leaf = fixture_bundle.bytes.items[offsets[0]..o0.slice.end];
+    const expected_intm = fixture_bundle.bytes.items[offsets[1]..o1.slice.end];
+
+    // Load-bearing ordering assertion: chain[0] == leaf, chain[1] == intermediate.
+    try testing.expectEqualSlices(u8, expected_leaf, chain.?[0]);
+    try testing.expectEqualSlices(u8, expected_intm, chain.?[1]);
+
+    // Leaf is also reachable via peerCertificate() (1b.13 contract).
+    try testing.expectEqualSlices(u8, expected_leaf, srv.peerCertificate().?);
+}
+
+test "peerChain with retain_chain on + .request + no cert returns null" {
+    // .request mode invites a cert but tolerates an empty Certificate
+    // flight. When the client declines, retain_chain has nothing to
+    // capture — peerChain() stays null, same as peerCertificate().
+    const alloc = testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const now = std.Io.Clock.real.now(io);
+    const rng_impl: std.Random.IoSource = .{ .io = io };
+    const rng = rng_impl.interface();
+
+    var server_auth = try common.CertKeyPair.fromSlice(alloc, io, mtls_test_cert_pem, mtls_test_key_pem);
+    defer server_auth.deinit(alloc);
+    var root_ca = try cert.fromSlice(alloc, io, mtls_test_cert_pem);
+    defer root_ca.deinit(alloc);
+
+    var srv = NonBlock.initWithAllocator(.{
+        .rng = rng,
+        .auth = &server_auth,
+        .now = now,
+        .client_auth = .{
+            .root_ca = root_ca,
+            .auth_type = .request,
+            .retain_chain = true,
+        },
+    }, alloc);
+    defer srv.deinit();
+    var cli = handshake_client_mod.NonBlock.init(.{
+        .rng = rng,
+        .root_ca = root_ca,
+        .host = "localhost",
+        .insecure_skip_verify = true,
+        .now = now,
+        // No auth — client declines to authenticate.
+    });
+
+    try driveHandshake(&cli, &srv, 12);
+    try testing.expect(srv.done());
+    try testing.expect(srv.peerCertificate() == null);
+    try testing.expect(srv.peerChain() == null);
 }
 
 // ---------------------------------------------------------------------
