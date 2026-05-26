@@ -201,14 +201,21 @@ pub const Handshake = struct {
     /// application_layer_protocol_negotiation extension — i.e. the
     /// sequence of <u8 len + proto_bytes> entries). Zero length means the
     /// client sent no ALPN extension OR sent an empty list.
-    /// Written unconditionally during `readClientHello` so that
-    /// `setAuth()` can re-run ALPN selection when an `alpn_protocols`
-    /// override is supplied. 512 bytes is well above any realistic
-    /// ClientHello ALPN list (typical entries: "h2"=2, "http/1.1"=9,
-    /// each prefixed by 1-byte length → list rarely exceeds 64 bytes).
+    /// Written during `readClientHello` ONLY when the server has a
+    /// non-empty `server_alpn_protocols` list (i.e. `Options.alpn_protocols
+    /// .len > 0`), so that `setAuth()` can re-run ALPN selection when an
+    /// `alpn_protocols` override is supplied. 512 bytes is well above any
+    /// realistic ClientHello ALPN list (typical entries: "h2"=2,
+    /// "http/1.1"=9, each prefixed by 1-byte length → rarely > 64 bytes).
+    /// Oversized lists (> 512 bytes) are rejected with `error.TlsDecodeError`.
     client_alpn_list_buf: [512]u8 = undefined,
     /// Number of valid bytes in `client_alpn_list_buf`. Zero until
     /// `readClientHello` has consumed the ALPN extension.
+    /// Note: this field is also `0` when the client sent no ALPN extension
+    /// at all (vs sent an empty list). The two cases are conflated by the
+    /// engine — both produce a null `alpn_protocol`. The protocol-level
+    /// distinction (RFC 7301 §3.1 calls an empty list malformed) is not
+    /// surfaced — pre-existing baseline behavior.
     client_alpn_list_len: u16 = 0,
 
     /// Phase 1b.24 — set by `setAuth()` when a non-null `alpn_protocols`
@@ -842,27 +849,38 @@ pub const Handshake = struct {
                 .application_layer_protocol_negotiation => {
                     // RFC 7301: parse client ALPN extension and select a protocol.
                     //
-                    // Phase 1b.24: regardless of whether the server has a
-                    // non-empty `server_alpn_protocols` list, ALWAYS capture
-                    // the raw client protocol list bytes into
-                    // `h.client_alpn_list_buf`. This lets `setAuth()` re-run
-                    // ALPN selection when a per-host `alpn_protocols` override
-                    // is supplied after the ClientHello has already been
-                    // consumed. The outer list_len u16 is decoded first (to
-                    // advance past it); we then copy the list content
-                    // (length-prefixed protocol names) into the inline buffer.
+                    // Phase 1b.24: when the server has a non-empty
+                    // `server_alpn_protocols` list, capture the raw client
+                    // protocol list bytes into `h.client_alpn_list_buf`. This
+                    // lets `setAuth()` re-run ALPN selection when a per-host
+                    // `alpn_protocols` override is supplied after the
+                    // ClientHello has already been consumed. The outer
+                    // list_len u16 is decoded first (to advance past it); we
+                    // then copy the list content (length-prefixed protocol
+                    // names) into the inline buffer.
+                    //
+                    // When `server_alpn_protocols.len == 0` (listener has no
+                    // ALPN configured), we skip past the client's list without
+                    // copying — preserving the no-cost-when-not-used invariant.
                     const list_len_u16 = try d.decode(u16);
                     const list_start = d.idx;
                     if (list_start + list_len_u16 > d.payload.len) return error.TlsDecodeError;
                     const list_end = list_start + list_len_u16;
-                    // Cache the raw list bytes (up to the buffer cap).
-                    // list_len_u16 <= 512 in any realistic ClientHello so
-                    // truncation should never occur in production.
-                    const to_copy = @min(list_len_u16, h.client_alpn_list_buf.len);
-                    @memcpy(h.client_alpn_list_buf[0..to_copy], d.payload[list_start .. list_start + to_copy]);
-                    h.client_alpn_list_len = @intCast(to_copy);
 
                     if (server_alpn_protocols.len > 0) {
+                        // C1: Reject oversized client ALPN list. 512 bytes is
+                        // well above any realistic ClientHello ALPN list
+                        // (typical: "h2"=2, "http/1.1"=9 each prefixed by
+                        // 1-byte length → rarely exceeds 64 bytes). A list
+                        // larger than the buffer would require truncation,
+                        // which would allow a malicious client to push real
+                        // protocol matches into the truncated tail, forcing a
+                        // spurious "no match" verdict in setAuth().
+                        if (list_len_u16 > h.client_alpn_list_buf.len) return error.TlsDecodeError;
+                        const to_copy = list_len_u16;
+                        @memcpy(h.client_alpn_list_buf[0..to_copy], d.payload[list_start .. list_start + to_copy]);
+                        h.client_alpn_list_len = to_copy;
+
                         // Find the first server protocol that the client supports
                         // (server preference order).
                         var best_match: ?[]const u8 = null;
@@ -886,8 +904,12 @@ pub const Handshake = struct {
                         }
                     } else {
                         // Server has no ALPN list configured — skip past
-                        // the client's list without selecting anything.
-                        d.idx = list_end;
+                        // the client's list without selecting or copying
+                        // anything. `client_alpn_list_len` stays at its
+                        // default 0; `setAuth()`'s override path correctly
+                        // handles "no captured client list" by clearing
+                        // `alpn_protocol`.
+                        try d.skip(list_len_u16);
                     }
                 },
                 else => {
@@ -1047,12 +1069,11 @@ pub const NonBlock = struct {
     ///                       preserves the selection already made during
     ///                       `readClientHello` (backward-compatible).
     ///
-    /// Idempotency invariant: if `auth_resolved` is already true (double-
-    /// call guard), the function re-stamps the same fields — a second
-    /// identical call is a no-op at the engine level because the state
-    /// machine has already advanced and `serverFlight` hasn't run yet.
-    /// The guard prevents double-mutation of `opt.client_auth` from
-    /// interleaved retry paths.
+    /// Idempotency: when called a second time after `auth_resolved` is set,
+    /// re-stamps `cert_key_pair` and returns. `client_auth` and `alpn_protocols`
+    /// from the second call are intentionally ignored — only the cert pointer
+    /// updates. This protects against any future state-machine bug that
+    /// re-enters `.awaiting_auth` after a valid resolution.
     pub fn setAuth(
         self: *Self,
         cert_key_pair: *const CertKeyPair,
@@ -1089,7 +1110,11 @@ pub const NonBlock = struct {
         // `error.TlsNoApplicationProtocol` — matching the behavior of
         // the inline ALPN path in readClientHello.
         if (alpn_protocols) |override| {
-            self.opt.alpn_protocols = override;
+            // C2: Reset before running override selection so this branch
+            // always starts from a known-clean state. The write `= true`
+            // on failure (or the implicit `false` on success) below keeps
+            // the invariant regardless of prior state.
+            self.inner.alpn_no_match = false;
             if (self.inner.client_alpn_list_len == 0 or override.len == 0) {
                 // Client sent no ALPN, or override is empty — no selection.
                 self.inner.alpn_protocol = null;
@@ -2525,6 +2550,82 @@ test "setAuth is idempotent — second call restamps cert, preserves first resol
     try driveHandshake(&cli, &srv, 12);
     try testing.expect(cli.done());
     try testing.expect(srv.done());
+}
+
+test "readClientHello rejects oversized client ALPN list with TlsDecodeError" {
+    // Construct a synthetic ClientHello whose ALPN extension carries a
+    // protocol list whose declared length exceeds the 512-byte buffer cap.
+    // The handshake MUST fail with error.TlsDecodeError, not silently
+    // truncate (which would allow a malicious client to push real protocol
+    // matches into the truncated tail of an oversized list).
+    //
+    // Strategy: drive a real client handshake to capture a valid ClientHello
+    // byte-for-byte, then find the ALPN extension and replace its list_len
+    // field with a value > 512. Feed the mutated bytes to a fresh server.
+    const alloc = testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const now = std.Io.Clock.real.now(io);
+    const rng_impl: std.Random.IoSource = .{ .io = io };
+    const rng = rng_impl.interface();
+
+    var server_auth = try common.CertKeyPair.fromSlice(alloc, io, mtls_test_cert_pem, mtls_test_key_pem);
+    defer server_auth.deinit(alloc);
+    var root_ca = try cert.fromSlice(alloc, io, mtls_test_cert_pem);
+    defer root_ca.deinit(alloc);
+
+    // Client advertises a short ALPN list (will be mutated below).
+    var cli = handshake_client_mod.NonBlock.init(.{
+        .rng = rng,
+        .root_ca = root_ca,
+        .host = "test.local",
+        .insecure_skip_verify = true,
+        .now = now,
+        .alpn_protocols = &.{"http/1.1"},
+    });
+    var srv = NonBlock.initForSniDispatch(.{
+        .rng = rng,
+        .auth = null,
+        .now = now,
+        .alpn_protocols = &.{"http/1.1"},
+    }, null);
+
+    var cs_buf: [max_ciphertext_record_len]u8 = undefined;
+    var sc_buf: [max_ciphertext_record_len]u8 = undefined;
+
+    // Client emits ClientHello into cs_buf.
+    const cr = try cli.run(&sc_buf, &cs_buf);
+    const cs_emitted = cs_buf[0..cr.send_pos];
+
+    // Locate the ALPN extension (type 0x00 0x10) in the ClientHello.
+    // Layout after extension type+len (4 bytes): u16 alpn_list_len, then
+    // u8 proto_len + proto_bytes per entry.
+    // We need to find the ALPN list_len u16 field and replace it with
+    // a value > 512 (e.g. 0x0201 = 513).
+    var found_alpn_list_len_pos: ?usize = null;
+    {
+        var i: usize = 0;
+        while (i + 6 <= cs_emitted.len) : (i += 1) {
+            // ALPN extension type = 0x00 0x10
+            if (cs_emitted[i] == 0x00 and cs_emitted[i + 1] == 0x10) {
+                // i+2, i+3 = extension data length
+                // i+4, i+5 = ALPN protocol list length (this is what we mutate)
+                found_alpn_list_len_pos = i + 4;
+                break;
+            }
+        }
+    }
+    try testing.expect(found_alpn_list_len_pos != null);
+    const pos = found_alpn_list_len_pos.?;
+
+    // Overwrite the ALPN list_len with 513 (> 512 buffer cap).
+    // Big-endian u16: 0x02 0x01 = 513.
+    cs_buf[pos] = 0x02;
+    cs_buf[pos + 1] = 0x01;
+
+    // Server MUST reject the oversized list with TlsDecodeError.
+    try testing.expectError(error.TlsDecodeError, srv.run(cs_emitted, &sc_buf));
 }
 
 test "setAuth applies cert + client_auth + alpn atomically before next run()" {
