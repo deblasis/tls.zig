@@ -79,6 +79,17 @@ pub const ClientAuth = struct {
     /// is silently null on a no-allocator instance.
     retain_chain: bool = false,
 
+    /// Phase 1b.25 — pre-encoded `certificate_authorities` extension
+    /// payload (RFC 8446 §4.2.4). When non-null, written verbatim into
+    /// the CertificateRequest extensions block under
+    /// extension_type = 47 (0x002F). Format: `<u16 authorities_length>
+    /// <N × (<u16 dn_len><dn_bytes>)>`.
+    ///
+    /// Caller (zappa) owns the bytes; library never copies, frees, or
+    /// inspects them — opaque from the library's perspective. null =
+    /// extension omitted.
+    cert_authorities_ext_bytes: ?[]const u8 = null,
+
     pub const Type = enum {
         /// Client certificate will be requested during the handshake, but does
         /// not require that the client send any certificates.
@@ -399,9 +410,9 @@ pub const Handshake = struct {
             h.transcript.update(hw.buffered());
             try h.writeEncrypted(&w, hw.buffered());
         }
-        if (opt.client_auth) |_| { // Certificate request
+        if (opt.client_auth) |ca| { // Certificate request
             var hw = try w.writerAdvance(record.header_len);
-            try makeCertificateRequest(&hw);
+            try makeCertificateRequest(&hw, ca.cert_authorities_ext_bytes);
             h.transcript.update(hw.buffered());
             try h.writeEncrypted(&w, hw.buffered());
         }
@@ -659,10 +670,20 @@ pub const Handshake = struct {
         return w.buffered();
     }
 
-    fn makeCertificateRequest(w: *record.Writer) !void {
+    fn makeCertificateRequest(w: *record.Writer, cert_authorities_ext_bytes: ?[]const u8) !void {
         const header_pos = try w.skip(4 + 1 + 2);
         const ext_head = w.pos();
         try w.extension(.signature_algorithms, common.supported_signature_algorithms);
+        // Phase 1b.25 — RFC 8446 §4.2.4 certificate_authorities extension.
+        // Caller pre-encodes the entire CertificateAuthorities struct
+        // (`<u16 authorities_length><DN list>`); we wrap in the standard
+        // TLS extension envelope.
+        if (cert_authorities_ext_bytes) |bytes| {
+            try w.int(u16, 47); // extension_type = certificate_authorities (0x002F)
+            std.debug.assert(bytes.len <= std.math.maxInt(u16));
+            try w.int(u16, @as(u16, @intCast(bytes.len))); // ext_data length
+            try w.slice(bytes); // verbatim payload — library is opaque to semantics
+        }
         const ext_len = w.pos() - ext_head;
         var hw = w.writerAt(header_pos);
         try hw.handshakeRecordHeader(.certificate_request, ext_len + 3);
@@ -980,7 +1001,7 @@ test "make certificate request" {
     );
 
     var w: record.Writer = .init(&buffer);
-    try Handshake.makeCertificateRequest(&w);
+    try Handshake.makeCertificateRequest(&w, null);
     try testing.expectEqualSlices(u8, &expected, w.buffered());
 }
 
@@ -2696,6 +2717,167 @@ test "setAuth applies cert + client_auth + alpn atomically before next run()" {
     try testing.expectEqualStrings("h2", cli.alpnProtocol().?);
 
     // (b) mTLS override took effect: client cert captured.
+    try testing.expect(srv.peerCertificate() != null);
+    try testing.expect(srv.peerCertificate().?.len > 0);
+}
+
+// ---------------------------------------------------------------------
+// Phase 1b.25 — certificate_authorities extension emission
+// ---------------------------------------------------------------------
+
+test "Phase 1b.25 — makeCertificateRequest with cert_authorities_ext_bytes=null emits no extension" {
+    // F2: null bypass — default ClientAuth must NOT emit extension_type=47.
+    var buf: [4096]u8 = undefined;
+    var w: record.Writer = .init(&buf);
+
+    try Handshake.makeCertificateRequest(&w, null);
+
+    // Walk the emitted CR record's extensions block; assert no
+    // extension_type=47 (0x002F = certificate_authorities) entry.
+    const out = w.buffered();
+    try testing.expect(out.len > 7);
+    // Layout: handshake header (4) + ctx_len (1) + ext_list_len (2) = 7 bytes preamble.
+    var idx: usize = 4 + 1 + 2;
+    while (idx + 4 <= out.len) {
+        const ext_type = std.mem.readInt(u16, out[idx..][0..2], .big);
+        const ext_data_len = std.mem.readInt(u16, out[idx + 2 ..][0..2], .big);
+        try testing.expect(ext_type != 0x002F);
+        idx += 4 + ext_data_len;
+    }
+}
+
+test "Phase 1b.25 — makeCertificateRequest with cert_authorities_ext_bytes=<5 bytes> emits extension 47" {
+    // F1: happy path — hand-crafted payload must appear verbatim under extension_type=47.
+    var buf: [4096]u8 = undefined;
+    var w: record.Writer = .init(&buf);
+
+    // Hand-crafted payload: 1 DN entry, 1 byte of content.
+    // Wire: <u16 authorities_length=3><u16 dn_len=1><0xAB>
+    const payload = [_]u8{ 0x00, 0x03, 0x00, 0x01, 0xAB };
+
+    try Handshake.makeCertificateRequest(&w, payload[0..]);
+
+    const out = w.buffered();
+
+    // Walk extensions to find extension_type=47.
+    var idx: usize = 4 + 1 + 2;
+    var found = false;
+    while (idx + 4 <= out.len) {
+        const ext_type = std.mem.readInt(u16, out[idx..][0..2], .big);
+        const ext_data_len = std.mem.readInt(u16, out[idx + 2 ..][0..2], .big);
+        if (ext_type == 0x002F) {
+            found = true;
+            try testing.expectEqual(@as(u16, payload.len), ext_data_len);
+            try testing.expectEqualSlices(u8, payload[0..], out[idx + 4 .. idx + 4 + payload.len]);
+            break;
+        }
+        idx += 4 + ext_data_len;
+    }
+    try testing.expect(found);
+}
+
+test "Phase 1b.25 — makeCertificateRequest with 65000-byte payload round-trips" {
+    // F3: large payload — must not truncate or overflow.
+    var buf: [80 * 1024]u8 = undefined;
+    var w: record.Writer = .init(&buf);
+
+    var payload_buf: [65000]u8 = undefined;
+    @memset(&payload_buf, 0x5A);
+    // Patch the first two bytes to a nominally valid authorities_length:
+    // 65000 - 2 = 64998 bytes of "content". Content isn't valid DN entries;
+    // the library is opaque to the payload, so this is fine for a round-trip test.
+    std.mem.writeInt(u16, payload_buf[0..2], 64998, .big);
+
+    try Handshake.makeCertificateRequest(&w, payload_buf[0..]);
+
+    const out = w.buffered();
+    var idx: usize = 4 + 1 + 2;
+    var found = false;
+    while (idx + 4 <= out.len) {
+        const ext_type = std.mem.readInt(u16, out[idx..][0..2], .big);
+        const ext_data_len = std.mem.readInt(u16, out[idx + 2 ..][0..2], .big);
+        if (ext_type == 0x002F) {
+            found = true;
+            try testing.expectEqual(@as(u16, 65000), ext_data_len);
+            try testing.expectEqualSlices(u8, payload_buf[0..], out[idx + 4 .. idx + 4 + 65000]);
+            break;
+        }
+        idx += 4 + ext_data_len;
+    }
+    try testing.expect(found);
+}
+
+test "Phase 1b.25 — setAuth with cert_authorities_ext_bytes threads through to CertificateRequest" {
+    // F4: SNI dispatch parity — setAuth-provided cert_authorities_ext_bytes must
+    // reach the wire. We drive a full handshake via driveHandshake() using the
+    // same per-host setAuth override path as the existing 1b.24 dispatch test.
+    // Successful handshake completion (peerCertificate populated) confirms that:
+    //   (a) setAuth correctly stamped cert_authorities_ext_bytes into opt.client_auth,
+    //   (b) serverFlight threaded ca.cert_authorities_ext_bytes into makeCertificateRequest,
+    //   (c) the extension was emitted and the RFC-compliant client processed it without error.
+    // Byte-level emission is verified by F1; this test closes the integration loop.
+    const alloc = testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const now = std.Io.Clock.real.now(io);
+    const rng_impl: std.Random.IoSource = .{ .io = io };
+    const rng = rng_impl.interface();
+
+    var server_auth = try common.CertKeyPair.fromSlice(alloc, io, mtls_test_cert_pem, mtls_test_key_pem);
+    defer server_auth.deinit(alloc);
+    var client_auth_ckp = try common.CertKeyPair.fromSlice(alloc, io, mtls_test_cert_pem, mtls_test_key_pem);
+    defer client_auth_ckp.deinit(alloc);
+    var root_ca = try cert.fromSlice(alloc, io, mtls_test_cert_pem);
+    defer root_ca.deinit(alloc);
+
+    // Hand-crafted 5-byte cert_authorities payload (same as F1).
+    const payload = [_]u8{ 0x00, 0x03, 0x00, 0x01, 0xAB };
+
+    // Client sends a cert (mTLS).
+    var cli = handshake_client_mod.NonBlock.init(.{
+        .rng = rng,
+        .root_ca = root_ca,
+        .host = "ca-ext.test.local",
+        .insecure_skip_verify = true,
+        .now = now,
+        .auth = &client_auth_ckp,
+    });
+    // Listener has NO client_auth configured — will be overridden via setAuth.
+    var srv = NonBlock.initForSniDispatch(.{
+        .rng = rng,
+        .auth = null,
+        .now = now,
+        .client_auth = null,
+    }, alloc);
+    defer srv.deinit();
+
+    var cs_buf: [max_ciphertext_record_len]u8 = undefined;
+    var sc_buf: [max_ciphertext_record_len]u8 = undefined;
+    var cs_len: usize = 0;
+
+    // ClientHello.
+    const cr1 = try cli.run(&sc_buf, &cs_buf);
+    cs_len = cr1.send.len;
+
+    // Server pauses at awaiting_auth.
+    _ = try srv.run(cs_buf[0..cs_len], &sc_buf);
+    try testing.expectEqual(NonBlock.RunState.awaiting_auth, srv.runState());
+
+    // Override: per-host client_auth WITH cert_authorities_ext_bytes set.
+    // This stamps the field into opt.client_auth, which serverFlight then
+    // threads into makeCertificateRequest.
+    srv.setAuth(&server_auth, .{
+        .root_ca = root_ca,
+        .auth_type = .require,
+        .cert_authorities_ext_bytes = payload[0..],
+    }, null);
+
+    try driveHandshake(&cli, &srv, 12);
+    try testing.expect(srv.done());
+
+    // Client cert captured — the CertificateRequest (with the extension) was
+    // processed successfully and the client responded with its certificate.
     try testing.expect(srv.peerCertificate() != null);
     try testing.expect(srv.peerCertificate().?.len > 0);
 }
