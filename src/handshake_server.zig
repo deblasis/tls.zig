@@ -79,6 +79,17 @@ pub const ClientAuth = struct {
     /// is silently null on a no-allocator instance.
     retain_chain: bool = false,
 
+    /// Phase 1b.25 — pre-encoded `certificate_authorities` extension
+    /// payload (RFC 8446 §4.2.4). When non-null, written verbatim into
+    /// the CertificateRequest extensions block under
+    /// extension_type = 47 (0x002F). Format: `<u16 authorities_length>
+    /// <N × (<u16 dn_len><dn_bytes>)>`.
+    ///
+    /// Caller (zappa) owns the bytes; library never copies, frees, or
+    /// inspects them — opaque from the library's perspective. null =
+    /// extension omitted.
+    cert_authorities_ext_bytes: ?[]const u8 = null,
+
     pub const Type = enum {
         /// Client certificate will be requested during the handshake, but does
         /// not require that the client send any certificates.
