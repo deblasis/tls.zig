@@ -1,3 +1,9 @@
+// PATCHED FROM upstream ianic/tls.zig (bc2e190 base)
+// Phase 1b.13 — leaf cert DER capture (peerCertificate)
+// Phase 1b.14 — SNI dispatch (setAuth, awaiting_auth pause, sniHost, rejectNoMatch)
+// Phase 1b.19 — chain bytes retention (retain_chain, peerChain)
+// Phase 1b.24 — setAuth widened to take ?ClientAuth + ?alpn_protocols overrides
+
 const std = @import("std");
 const assert = std.debug.assert;
 const mem = std.mem;
@@ -190,6 +196,36 @@ pub const Handshake = struct {
     /// RFC 6066 §3.
     no_match_abort: bool = false,
 
+    /// Phase 1b.24 — raw bytes of the client's ALPN protocol list
+    /// (the wire content AFTER the 2-byte outer list_len field in the
+    /// application_layer_protocol_negotiation extension — i.e. the
+    /// sequence of <u8 len + proto_bytes> entries). Zero length means the
+    /// client sent no ALPN extension OR sent an empty list.
+    /// Written during `readClientHello` ONLY when the server has a
+    /// non-empty `server_alpn_protocols` list (i.e. `Options.alpn_protocols
+    /// .len > 0`), so that `setAuth()` can re-run ALPN selection when an
+    /// `alpn_protocols` override is supplied. 512 bytes is well above any
+    /// realistic ClientHello ALPN list (typical entries: "h2"=2,
+    /// "http/1.1"=9, each prefixed by 1-byte length → rarely > 64 bytes).
+    /// Oversized lists (> 512 bytes) are rejected with `error.TlsDecodeError`.
+    client_alpn_list_buf: [512]u8 = undefined,
+    /// Number of valid bytes in `client_alpn_list_buf`. Zero until
+    /// `readClientHello` has consumed the ALPN extension.
+    /// Note: this field is also `0` when the client sent no ALPN extension
+    /// at all (vs sent an empty list). The two cases are conflated by the
+    /// engine — both produce a null `alpn_protocol`. The protocol-level
+    /// distinction (RFC 7301 §3.1 calls an empty list malformed) is not
+    /// surfaced — pre-existing baseline behavior.
+    client_alpn_list_len: u16 = 0,
+
+    /// Phase 1b.24 — set by `setAuth()` when a non-null `alpn_protocols`
+    /// override is supplied AND the re-run ALPN selection finds no overlap
+    /// between the override list and the client's offer. When true,
+    /// `serverFlight` surfaces `error.TlsNoApplicationProtocol` before
+    /// emitting any flight bytes — mirroring the existing inline behavior
+    /// in `readClientHello`.
+    alpn_no_match: bool = false,
+
     const Self = @This();
 
     /// Accessor for the parsed SNI hostname. Returns null when
@@ -320,6 +356,12 @@ pub const Handshake = struct {
         // emits an unrecognized_name alert before any post-ClientHello
         // flight bytes hit the wire.
         if (h.no_match_abort) return error.TlsUnrecognizedName;
+
+        // Phase 1b.24 — per-host ALPN override no-overlap: setAuth()
+        // found no intersection between the per-host alpn_protocols and
+        // the client's offered list. Surface the same error that
+        // readClientHello would have raised on the inline path.
+        if (h.alpn_no_match) return error.TlsNoApplicationProtocol;
 
         var w: record.Writer = .initFromIo(h.output);
 
@@ -805,11 +847,42 @@ pub const Handshake = struct {
                     }
                 },
                 .application_layer_protocol_negotiation => {
-                    // RFC 7301: parse client ALPN extension and select a protocol
+                    // RFC 7301: parse client ALPN extension and select a protocol.
+                    //
+                    // Phase 1b.24: when the server has a non-empty
+                    // `server_alpn_protocols` list, capture the raw client
+                    // protocol list bytes into `h.client_alpn_list_buf`. This
+                    // lets `setAuth()` re-run ALPN selection when a per-host
+                    // `alpn_protocols` override is supplied after the
+                    // ClientHello has already been consumed. The outer
+                    // list_len u16 is decoded first (to advance past it); we
+                    // then copy the list content (length-prefixed protocol
+                    // names) into the inline buffer.
+                    //
+                    // When `server_alpn_protocols.len == 0` (listener has no
+                    // ALPN configured), we skip past the client's list without
+                    // copying — preserving the no-cost-when-not-used invariant.
+                    const list_len_u16 = try d.decode(u16);
+                    const list_start = d.idx;
+                    if (list_start + list_len_u16 > d.payload.len) return error.TlsDecodeError;
+                    const list_end = list_start + list_len_u16;
+
                     if (server_alpn_protocols.len > 0) {
-                        const list_end = try d.decode(u16) + d.idx;
+                        // C1: Reject oversized client ALPN list. 512 bytes is
+                        // well above any realistic ClientHello ALPN list
+                        // (typical: "h2"=2, "http/1.1"=9 each prefixed by
+                        // 1-byte length → rarely exceeds 64 bytes). A list
+                        // larger than the buffer would require truncation,
+                        // which would allow a malicious client to push real
+                        // protocol matches into the truncated tail, forcing a
+                        // spurious "no match" verdict in setAuth().
+                        if (list_len_u16 > h.client_alpn_list_buf.len) return error.TlsDecodeError;
+                        const to_copy = list_len_u16;
+                        @memcpy(h.client_alpn_list_buf[0..to_copy], d.payload[list_start .. list_start + to_copy]);
+                        h.client_alpn_list_len = to_copy;
+
                         // Find the first server protocol that the client supports
-                        // (server preference order)
+                        // (server preference order).
                         var best_match: ?[]const u8 = null;
                         var best_server_idx: usize = server_alpn_protocols.len;
                         const saved_idx = d.idx;
@@ -830,7 +903,13 @@ pub const Handshake = struct {
                             return error.TlsNoApplicationProtocol;
                         }
                     } else {
-                        try d.skip(extension_len);
+                        // Server has no ALPN list configured — skip past
+                        // the client's list without selecting or copying
+                        // anything. `client_alpn_list_len` stays at its
+                        // default 0; `setAuth()`'s override path correctly
+                        // handles "no captured client list" by clearing
+                        // `alpn_protocol`.
+                        try d.skip(list_len_u16);
                     }
                 },
                 else => {
@@ -972,11 +1051,97 @@ pub const NonBlock = struct {
     /// `signature_scheme` is validated against the client's offered
     /// `signature_algorithms` list (cached during `readClientHello`) —
     /// mismatch trips `error.TlsHandshakeFailure` on the next `run()`.
+    ///
+    /// Phase 1b.24 — extended with two optional per-host override params:
+    ///
+    ///   `client_auth`     — when non-null, REPLACES `Options.client_auth`
+    ///                       on this NonBlock.Server before the next run().
+    ///                       The replacement takes effect before
+    ///                       CertificateRequest emission in `serverFlight`.
+    ///                       Null preserves the value in `Options` (backward-
+    ///                       compatible with pre-1b.24 callers).
+    ///
+    ///   `alpn_protocols`  — when non-null, re-runs ALPN selection using
+    ///                       the supplied list against the client's offered
+    ///                       protocols (cached from `readClientHello`).
+    ///                       The result overwrites `inner.alpn_protocol`
+    ///                       BEFORE EncryptedExtensions emission. Null
+    ///                       preserves the selection already made during
+    ///                       `readClientHello` (backward-compatible).
+    ///
+    /// Idempotency: when called a second time after `auth_resolved` is set,
+    /// re-stamps `cert_key_pair` and returns. `client_auth` and `alpn_protocols`
+    /// from the second call are intentionally ignored — only the cert pointer
+    /// updates. This protects against any future state-machine bug that
+    /// re-enters `.awaiting_auth` after a valid resolution.
     pub fn setAuth(
         self: *Self,
         cert_key_pair: *const CertKeyPair,
+        client_auth: ?ClientAuth,
+        alpn_protocols: ?[]const []const u8,
     ) void {
+        // Idempotency guard: if we've already resolved auth (e.g. a buggy
+        // double-call) re-stamp the cert but leave everything else alone.
+        // The engine's state machine gates on `auth_resolved`; once it's
+        // true the handshake proceeds unconditionally on the next run().
+        if (self.inner.auth_resolved) {
+            self.inner.opt_auth = cert_key_pair;
+            return;
+        }
+
         self.inner.opt_auth = cert_key_pair;
+
+        // Per-host client_auth override — applied BEFORE serverFlight
+        // consults `opt.client_auth` to decide whether to emit
+        // CertificateRequest. Non-null replaces; null = preserve Options.
+        if (client_auth) |ca| {
+            self.opt.client_auth = ca;
+        }
+
+        // Per-host ALPN override — re-run selection against the cached
+        // client offer (captured in `readClientHello`).  Non-null
+        // overrides the already-selected `inner.alpn_protocol`; null
+        // preserves the selection made in readClientHello.
+        //
+        // If the client sent no ALPN extension OR the override list is
+        // empty, clear `inner.alpn_protocol` (no ALPN response). If the
+        // client offered protocols but none overlap with the override
+        // list, set the no_alpn_match flag so serverFlight can surface
+        // `error.TlsNoApplicationProtocol` — matching the behavior of
+        // the inline ALPN path in readClientHello.
+        if (alpn_protocols) |override| {
+            // C2: Reset before running override selection so this branch
+            // always starts from a known-clean state. The write `= true`
+            // on failure (or the implicit `false` on success) below keeps
+            // the invariant regardless of prior state.
+            self.inner.alpn_no_match = false;
+            if (self.inner.client_alpn_list_len == 0 or override.len == 0) {
+                // Client sent no ALPN, or override is empty — no selection.
+                self.inner.alpn_protocol = null;
+            } else {
+                // Re-run selection: iterate override list in preference
+                // order, pick the first protocol the client also offered.
+                const raw = self.inner.client_alpn_list_buf[0..self.inner.client_alpn_list_len];
+                var best: ?[]const u8 = null;
+                outer: for (override) |srv_proto| {
+                    var pos: usize = 0;
+                    while (pos < raw.len) {
+                        const plen = raw[pos];
+                        pos += 1;
+                        if (pos + plen > raw.len) break; // malformed — stop
+                        const cli_proto = raw[pos .. pos + plen];
+                        pos += plen;
+                        if (mem.eql(u8, cli_proto, srv_proto)) {
+                            best = srv_proto;
+                            break :outer;
+                        }
+                    }
+                }
+                self.inner.alpn_protocol = best;
+                self.inner.alpn_no_match = (best == null);
+            }
+        }
+
         self.inner.auth_resolved = true;
     }
 
@@ -1850,8 +2015,8 @@ test "sniHost survives across awaiting_auth pause" {
     try testing.expect(sni_second != null);
     try testing.expectEqualStrings(expected_sni, sni_second.?);
 
-    // Resolve via setAuth, drive to completion.
-    srv.setAuth(&server_auth);
+    // Resolve via setAuth (null new params = preserve Options defaults).
+    srv.setAuth(&server_auth, null, null);
     try testing.expectEqual(NonBlock.RunState.in_progress, srv.runState());
 
     var rounds: usize = 0;
@@ -1928,8 +2093,8 @@ test "setAuth swaps server cert during handshake" {
     try testing.expectEqual(NonBlock.RunState.awaiting_auth, srv.runState());
     cs_len = 0;
 
-    // Resolve.
-    srv.setAuth(&swap_auth);
+    // Resolve (null new params = preserve Options defaults).
+    srv.setAuth(&swap_auth, null, null);
 
     // Drive to completion.
     var rounds: usize = 0;
@@ -2083,4 +2248,454 @@ test "rejectNoMatch sends unrecognized_name alert" {
 
     // Next run() should bubble out TlsUnrecognizedName from serverFlight.
     try testing.expectError(error.TlsUnrecognizedName, srv.run(&.{}, &sc_buf));
+}
+
+// =====================================================================
+// Phase 1b.24 — setAuth widened: ?ClientAuth + ?alpn_protocols overrides
+// =====================================================================
+
+test "setAuth(cert, null, null) preserves Options defaults (backward-compat)" {
+    // Construct an SNI-dispatch server with Options.client_auth set and
+    // Options.alpn_protocols set. Call setAuth(cert, null, null). Both
+    // null params MUST preserve the values in Options — bit-identical
+    // pre-1b.24 behavior. Handshake must complete successfully and the
+    // negotiated ALPN must match what Options specified.
+    const alloc = testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const now = std.Io.Clock.real.now(io);
+    const rng_impl: std.Random.IoSource = .{ .io = io };
+    const rng = rng_impl.interface();
+
+    var server_auth = try common.CertKeyPair.fromSlice(alloc, io, mtls_test_cert_pem, mtls_test_key_pem);
+    defer server_auth.deinit(alloc);
+    var root_ca = try cert.fromSlice(alloc, io, mtls_test_cert_pem);
+    defer root_ca.deinit(alloc);
+
+    // Client advertises ALPN "http/1.1".
+    var cli = handshake_client_mod.NonBlock.init(.{
+        .rng = rng,
+        .root_ca = root_ca,
+        .host = "test.local",
+        .insecure_skip_verify = true,
+        .now = now,
+        .alpn_protocols = &.{"http/1.1"},
+    });
+    // Server has Options.alpn_protocols = ["http/1.1"] at construction.
+    var srv = NonBlock.initForSniDispatch(.{
+        .rng = rng,
+        .auth = null,
+        .now = now,
+        .alpn_protocols = &.{"http/1.1"},
+    }, null);
+
+    var cs_buf: [max_ciphertext_record_len]u8 = undefined;
+    var sc_buf: [max_ciphertext_record_len]u8 = undefined;
+    var cs_len: usize = 0;
+
+    // Client emits ClientHello.
+    const cr1 = try cli.run(&sc_buf, &cs_buf);
+    cs_len = cr1.send.len;
+
+    // Server pauses at awaiting_auth.
+    _ = try srv.run(cs_buf[0..cs_len], &sc_buf);
+    try testing.expectEqual(NonBlock.RunState.awaiting_auth, srv.runState());
+
+    // Resolve — null for both new params: preserves Options defaults.
+    srv.setAuth(&server_auth, null, null);
+    try testing.expectEqual(NonBlock.RunState.in_progress, srv.runState());
+
+    // Drive to completion.
+    try driveHandshake(&cli, &srv, 12);
+    try testing.expect(cli.done());
+    try testing.expect(srv.done());
+
+    // Options.alpn_protocols = ["http/1.1"] was preserved — negotiated ALPN
+    // should be "http/1.1".
+    try testing.expectEqualStrings("http/1.1", srv.alpnProtocol().?);
+    try testing.expectEqualStrings("http/1.1", cli.alpnProtocol().?);
+}
+
+test "setAuth(cert, null, alpn_override) selects ALPN from per-host override list" {
+    // Listener Options.alpn_protocols = ["h2","http/1.1"] (full list).
+    // Client offers ["h2","http/1.1"].
+    // setAuth resolves with alpn_override = ["http/1.1"] only.
+    // Expected: negotiated ALPN is "http/1.1" — the per-host restriction took effect.
+    const alloc = testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const now = std.Io.Clock.real.now(io);
+    const rng_impl: std.Random.IoSource = .{ .io = io };
+    const rng = rng_impl.interface();
+
+    var server_auth = try common.CertKeyPair.fromSlice(alloc, io, mtls_test_cert_pem, mtls_test_key_pem);
+    defer server_auth.deinit(alloc);
+    var root_ca = try cert.fromSlice(alloc, io, mtls_test_cert_pem);
+    defer root_ca.deinit(alloc);
+
+    // Client advertises both "h2" and "http/1.1".
+    var cli = handshake_client_mod.NonBlock.init(.{
+        .rng = rng,
+        .root_ca = root_ca,
+        .host = "api.test.local",
+        .insecure_skip_verify = true,
+        .now = now,
+        .alpn_protocols = &.{ "h2", "http/1.1" },
+    });
+    // Listener supports both.
+    var srv = NonBlock.initForSniDispatch(.{
+        .rng = rng,
+        .auth = null,
+        .now = now,
+        .alpn_protocols = &.{ "h2", "http/1.1" },
+    }, null);
+
+    var cs_buf: [max_ciphertext_record_len]u8 = undefined;
+    var sc_buf: [max_ciphertext_record_len]u8 = undefined;
+    var cs_len: usize = 0;
+
+    // ClientHello.
+    const cr1 = try cli.run(&sc_buf, &cs_buf);
+    cs_len = cr1.send.len;
+
+    // Server pauses.
+    _ = try srv.run(cs_buf[0..cs_len], &sc_buf);
+    try testing.expectEqual(NonBlock.RunState.awaiting_auth, srv.runState());
+
+    // Override: this host only supports "http/1.1".
+    srv.setAuth(&server_auth, null, &.{"http/1.1"});
+
+    try driveHandshake(&cli, &srv, 12);
+    try testing.expect(srv.done());
+
+    // Override restricted selection to "http/1.1" even though both sides
+    // would have negotiated "h2" with the listener-wide list.
+    try testing.expectEqualStrings("http/1.1", srv.alpnProtocol().?);
+    try testing.expectEqualStrings("http/1.1", cli.alpnProtocol().?);
+}
+
+test "setAuth(cert, ClientAuth{...}, null) causes server to emit CertificateRequest" {
+    // Listener Options.client_auth = null (no mTLS by default).
+    // setAuth is called with a per-host ClientAuth override.
+    // Expected: handshake completes with mTLS — server gets the client cert.
+    const alloc = testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const now = std.Io.Clock.real.now(io);
+    const rng_impl: std.Random.IoSource = .{ .io = io };
+    const rng = rng_impl.interface();
+
+    var server_auth = try common.CertKeyPair.fromSlice(alloc, io, mtls_test_cert_pem, mtls_test_key_pem);
+    defer server_auth.deinit(alloc);
+    var client_auth = try common.CertKeyPair.fromSlice(alloc, io, mtls_test_cert_pem, mtls_test_key_pem);
+    defer client_auth.deinit(alloc);
+    var root_ca = try cert.fromSlice(alloc, io, mtls_test_cert_pem);
+    defer root_ca.deinit(alloc);
+
+    // Client sends a cert.
+    var cli = handshake_client_mod.NonBlock.init(.{
+        .rng = rng,
+        .root_ca = root_ca,
+        .host = "secure.test.local",
+        .insecure_skip_verify = true,
+        .now = now,
+        .auth = &client_auth,
+    });
+    // Listener has NO client_auth configured.
+    var srv = NonBlock.initForSniDispatch(.{
+        .rng = rng,
+        .auth = null,
+        .now = now,
+        .client_auth = null,
+    }, alloc);
+    defer srv.deinit();
+
+    var cs_buf: [max_ciphertext_record_len]u8 = undefined;
+    var sc_buf: [max_ciphertext_record_len]u8 = undefined;
+    var cs_len: usize = 0;
+
+    // ClientHello.
+    const cr1 = try cli.run(&sc_buf, &cs_buf);
+    cs_len = cr1.send.len;
+
+    // Server pauses.
+    _ = try srv.run(cs_buf[0..cs_len], &sc_buf);
+    try testing.expectEqual(NonBlock.RunState.awaiting_auth, srv.runState());
+
+    // Override: this host requires client cert authentication.
+    srv.setAuth(&server_auth, .{
+        .root_ca = root_ca,
+        .auth_type = .require,
+    }, null);
+
+    try driveHandshake(&cli, &srv, 12);
+    try testing.expect(srv.done());
+
+    // peerCertificate should be populated — the per-host client_auth override
+    // caused CertificateRequest to be emitted, and the client responded.
+    try testing.expect(srv.peerCertificate() != null);
+    try testing.expect(srv.peerCertificate().?.len > 0);
+}
+
+test "setAuth with non-overlapping ALPN override emits no_application_protocol error" {
+    // Listener Options.alpn_protocols = ["http/1.1"].
+    // Client offers ["http/1.1"].
+    // setAuth is called with alpn_override = ["h2"] — no overlap with client.
+    // Expected: run() returns error.TlsNoApplicationProtocol.
+    const alloc = testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const now = std.Io.Clock.real.now(io);
+    const rng_impl: std.Random.IoSource = .{ .io = io };
+    const rng = rng_impl.interface();
+
+    var server_auth = try common.CertKeyPair.fromSlice(alloc, io, mtls_test_cert_pem, mtls_test_key_pem);
+    defer server_auth.deinit(alloc);
+    var root_ca = try cert.fromSlice(alloc, io, mtls_test_cert_pem);
+    defer root_ca.deinit(alloc);
+
+    // Client advertises only "http/1.1".
+    var cli = handshake_client_mod.NonBlock.init(.{
+        .rng = rng,
+        .root_ca = root_ca,
+        .host = "old.test.local",
+        .insecure_skip_verify = true,
+        .now = now,
+        .alpn_protocols = &.{"http/1.1"},
+    });
+    // Listener supports "http/1.1".
+    var srv = NonBlock.initForSniDispatch(.{
+        .rng = rng,
+        .auth = null,
+        .now = now,
+        .alpn_protocols = &.{"http/1.1"},
+    }, null);
+
+    var cs_buf: [max_ciphertext_record_len]u8 = undefined;
+    var sc_buf: [max_ciphertext_record_len]u8 = undefined;
+    var cs_len: usize = 0;
+
+    // ClientHello.
+    const cr1 = try cli.run(&sc_buf, &cs_buf);
+    cs_len = cr1.send.len;
+
+    // Server pauses at awaiting_auth.
+    _ = try srv.run(cs_buf[0..cs_len], &sc_buf);
+    try testing.expectEqual(NonBlock.RunState.awaiting_auth, srv.runState());
+
+    // Override: this host only accepts "h2" — but the client didn't offer it.
+    srv.setAuth(&server_auth, null, &.{"h2"});
+
+    // The next run() should fail with TlsNoApplicationProtocol because the
+    // per-host override has no overlap with the client's offer.
+    var sc_buf2: [max_ciphertext_record_len]u8 = undefined;
+    try testing.expectError(error.TlsNoApplicationProtocol, srv.run(&.{}, &sc_buf2));
+}
+
+test "setAuth is idempotent — second call restamps cert, preserves first resolved state" {
+    // Drive the handshake to awaiting_auth, call setAuth twice. The second
+    // call must not corrupt state. Handshake should complete successfully.
+    const alloc = testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const now = std.Io.Clock.real.now(io);
+    const rng_impl: std.Random.IoSource = .{ .io = io };
+    const rng = rng_impl.interface();
+
+    var server_auth = try common.CertKeyPair.fromSlice(alloc, io, mtls_test_cert_pem, mtls_test_key_pem);
+    defer server_auth.deinit(alloc);
+    var root_ca = try cert.fromSlice(alloc, io, mtls_test_cert_pem);
+    defer root_ca.deinit(alloc);
+
+    var cli = handshake_client_mod.NonBlock.init(.{
+        .rng = rng,
+        .root_ca = root_ca,
+        .host = "test.local",
+        .insecure_skip_verify = true,
+        .now = now,
+    });
+    var srv = NonBlock.initForSniDispatch(.{
+        .rng = rng,
+        .auth = null,
+        .now = now,
+    }, null);
+
+    var cs_buf: [max_ciphertext_record_len]u8 = undefined;
+    var sc_buf: [max_ciphertext_record_len]u8 = undefined;
+    var cs_len: usize = 0;
+
+    // ClientHello.
+    const cr1 = try cli.run(&sc_buf, &cs_buf);
+    cs_len = cr1.send.len;
+
+    // Server pauses.
+    _ = try srv.run(cs_buf[0..cs_len], &sc_buf);
+    try testing.expectEqual(NonBlock.RunState.awaiting_auth, srv.runState());
+
+    // First call — resolves auth.
+    srv.setAuth(&server_auth, null, null);
+    try testing.expectEqual(NonBlock.RunState.in_progress, srv.runState());
+
+    // Second call — must be a no-op / restamp; must NOT panic or corrupt state.
+    srv.setAuth(&server_auth, null, null);
+    // State must still be in_progress (not re-paused or corrupted).
+    try testing.expectEqual(NonBlock.RunState.in_progress, srv.runState());
+
+    // Drive to completion.
+    try driveHandshake(&cli, &srv, 12);
+    try testing.expect(cli.done());
+    try testing.expect(srv.done());
+}
+
+test "readClientHello rejects oversized client ALPN list with TlsDecodeError" {
+    // Construct a synthetic ClientHello whose ALPN extension carries a
+    // protocol list whose declared length exceeds the 512-byte buffer cap.
+    // The handshake MUST fail with error.TlsDecodeError, not silently
+    // truncate (which would allow a malicious client to push real protocol
+    // matches into the truncated tail of an oversized list).
+    //
+    // Strategy: drive a real client handshake to capture a valid ClientHello
+    // byte-for-byte, then find the ALPN extension and replace its list_len
+    // field with a value > 512. Feed the mutated bytes to a fresh server.
+    const alloc = testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const now = std.Io.Clock.real.now(io);
+    const rng_impl: std.Random.IoSource = .{ .io = io };
+    const rng = rng_impl.interface();
+
+    var server_auth = try common.CertKeyPair.fromSlice(alloc, io, mtls_test_cert_pem, mtls_test_key_pem);
+    defer server_auth.deinit(alloc);
+    var root_ca = try cert.fromSlice(alloc, io, mtls_test_cert_pem);
+    defer root_ca.deinit(alloc);
+
+    // Client advertises a short ALPN list (will be mutated below).
+    var cli = handshake_client_mod.NonBlock.init(.{
+        .rng = rng,
+        .root_ca = root_ca,
+        .host = "test.local",
+        .insecure_skip_verify = true,
+        .now = now,
+        .alpn_protocols = &.{"http/1.1"},
+    });
+    var srv = NonBlock.initForSniDispatch(.{
+        .rng = rng,
+        .auth = null,
+        .now = now,
+        .alpn_protocols = &.{"http/1.1"},
+    }, null);
+
+    var cs_buf: [max_ciphertext_record_len]u8 = undefined;
+    var sc_buf: [max_ciphertext_record_len]u8 = undefined;
+
+    // Client emits ClientHello into cs_buf.
+    const cr = try cli.run(&sc_buf, &cs_buf);
+    const cs_emitted = cs_buf[0..cr.send_pos];
+
+    // Locate the ALPN extension (type 0x00 0x10) in the ClientHello.
+    // Layout after extension type+len (4 bytes): u16 alpn_list_len, then
+    // u8 proto_len + proto_bytes per entry.
+    // We need to find the ALPN list_len u16 field and replace it with
+    // a value > 512 (e.g. 0x0201 = 513).
+    var found_alpn_list_len_pos: ?usize = null;
+    {
+        var i: usize = 0;
+        while (i + 6 <= cs_emitted.len) : (i += 1) {
+            // ALPN extension type = 0x00 0x10
+            if (cs_emitted[i] == 0x00 and cs_emitted[i + 1] == 0x10) {
+                // i+2, i+3 = extension data length
+                // i+4, i+5 = ALPN protocol list length (this is what we mutate)
+                found_alpn_list_len_pos = i + 4;
+                break;
+            }
+        }
+    }
+    try testing.expect(found_alpn_list_len_pos != null);
+    const pos = found_alpn_list_len_pos.?;
+
+    // Overwrite the ALPN list_len with 513 (> 512 buffer cap).
+    // Big-endian u16: 0x02 0x01 = 513.
+    cs_buf[pos] = 0x02;
+    cs_buf[pos + 1] = 0x01;
+
+    // Server MUST reject the oversized list with TlsDecodeError.
+    try testing.expectError(error.TlsDecodeError, srv.run(cs_emitted, &sc_buf));
+}
+
+test "setAuth applies cert + client_auth + alpn atomically before next run()" {
+    // Listener Options.alpn_protocols = ["http/1.1"], client_auth = null.
+    // Client offers ["h2","http/1.1"] and sends a client cert.
+    // setAuth(cert, ClientAuth{.require}, &.{"h2"}) must atomically:
+    //   (a) pick "h2" from the client's ALPN offer, AND
+    //   (b) emit CertificateRequest (per-host mTLS override).
+    // Both must happen in the SAME server flight.
+    const alloc = testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const now = std.Io.Clock.real.now(io);
+    const rng_impl: std.Random.IoSource = .{ .io = io };
+    const rng = rng_impl.interface();
+
+    var server_auth = try common.CertKeyPair.fromSlice(alloc, io, mtls_test_cert_pem, mtls_test_key_pem);
+    defer server_auth.deinit(alloc);
+    var client_auth_ckp = try common.CertKeyPair.fromSlice(alloc, io, mtls_test_cert_pem, mtls_test_key_pem);
+    defer client_auth_ckp.deinit(alloc);
+    var root_ca = try cert.fromSlice(alloc, io, mtls_test_cert_pem);
+    defer root_ca.deinit(alloc);
+
+    // Client offers both ALPN protocols and sends a cert.
+    var cli = handshake_client_mod.NonBlock.init(.{
+        .rng = rng,
+        .root_ca = root_ca,
+        .host = "both.test.local",
+        .insecure_skip_verify = true,
+        .now = now,
+        .alpn_protocols = &.{ "h2", "http/1.1" },
+        .auth = &client_auth_ckp,
+    });
+    // Listener: http/1.1 only ALPN, no mTLS.
+    var srv = NonBlock.initForSniDispatch(.{
+        .rng = rng,
+        .auth = null,
+        .now = now,
+        .alpn_protocols = &.{"http/1.1"},
+        .client_auth = null,
+    }, alloc);
+    defer srv.deinit();
+
+    var cs_buf: [max_ciphertext_record_len]u8 = undefined;
+    var sc_buf: [max_ciphertext_record_len]u8 = undefined;
+    var cs_len: usize = 0;
+
+    // ClientHello.
+    const cr1 = try cli.run(&sc_buf, &cs_buf);
+    cs_len = cr1.send.len;
+
+    // Server pauses.
+    _ = try srv.run(cs_buf[0..cs_len], &sc_buf);
+    try testing.expectEqual(NonBlock.RunState.awaiting_auth, srv.runState());
+
+    // Atomic override: BOTH per-host client_auth AND per-host ALPN applied in one call.
+    srv.setAuth(&server_auth, .{
+        .root_ca = root_ca,
+        .auth_type = .require,
+    }, &.{"h2"});
+
+    try driveHandshake(&cli, &srv, 12);
+    try testing.expect(srv.done());
+
+    // (a) ALPN override took effect: "h2" selected, not "http/1.1".
+    try testing.expectEqualStrings("h2", srv.alpnProtocol().?);
+    try testing.expectEqualStrings("h2", cli.alpnProtocol().?);
+
+    // (b) mTLS override took effect: client cert captured.
+    try testing.expect(srv.peerCertificate() != null);
+    try testing.expect(srv.peerCertificate().?.len > 0);
 }
