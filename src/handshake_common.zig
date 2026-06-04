@@ -16,6 +16,12 @@ const EcdsaP256Sha256 = crypto.sign.ecdsa.EcdsaP256Sha256;
 const EcdsaP384Sha384 = crypto.sign.ecdsa.EcdsaP384Sha384;
 const MLKem768 = crypto.kem.ml_kem.MLKem768;
 
+/// Zappa 1b.23 Bug 1 chip — conservative upper bound on signature size
+/// across supported schemes. ECDSA DER: ~104 bytes (P-384). RSA-PSS:
+/// up to 512 bytes (4096-bit modulus). Caller-provided sig_buf for
+/// `CertKeyPair.signSelfTest` must be at least this large.
+pub const MAX_SIGNATURE_LEN: usize = 512;
+
 pub const supported_signature_algorithms = &[_]proto.SignatureScheme{
     .ecdsa_secp256r1_sha256,
     .ecdsa_secp384r1_sha384,
@@ -99,6 +105,106 @@ pub const CertKeyPair = struct {
 
     pub fn deinit(c: *CertKeyPair, allocator: mem.Allocator) void {
         c.bundle.deinit(allocator);
+    }
+
+    /// Zappa 1b.23 Bug 1 chip — sign `message` using the parsed
+    /// private key. Reuses the same primitives as
+    /// `CertificateBuilder.makeCertificateVerify` (ECDSA via
+    /// std.crypto signer chain; RSA-PSS via signerOaep).
+    ///
+    /// Writes the encoded signature bytes into `sig_buf` and returns
+    /// a slice of the bytes used. `sig_buf` must be at least
+    /// `MAX_SIGNATURE_LEN` bytes.
+    ///
+    /// `rng` is required for RSA-PSS (probabilistic). For ECDSA the
+    /// signer is deterministic per std.crypto's API; `rng` is ignored
+    /// on the ECDSA path.
+    pub fn signSelfTest(
+        self: *const CertKeyPair,
+        message: []const u8,
+        sig_buf: []u8,
+        rng: std.Random,
+    ) ![]const u8 {
+        if (sig_buf.len < MAX_SIGNATURE_LEN) return error.SignatureBufferTooSmall;
+        switch (self.key.signature_scheme) {
+            inline .ecdsa_secp256r1_sha256,
+            .ecdsa_secp384r1_sha384,
+            => |comptime_scheme| {
+                const Ecdsa = SchemeEcdsa(comptime_scheme);
+                const key_pair = switch (comptime_scheme) {
+                    .ecdsa_secp256r1_sha256 => self.ecdsa_key_pair.?.ecdsa_secp256r1_sha256,
+                    .ecdsa_secp384r1_sha384 => self.ecdsa_key_pair.?.ecdsa_secp384r1_sha384,
+                    else => unreachable,
+                };
+                var signer = try key_pair.signer(null);
+                signer.update(message);
+                const signature = try signer.finalize();
+                const der_len = Ecdsa.Signature.der_encoded_length_max;
+                const sig_der = signature.toDer(sig_buf[0..der_len]);
+                return sig_der;
+            },
+            inline .rsa_pss_rsae_sha256,
+            .rsa_pss_rsae_sha384,
+            .rsa_pss_rsae_sha512,
+            => |comptime_scheme| {
+                const Hash = SchemeHash(comptime_scheme);
+                var signer = try self.key.key.rsa.signerOaep(Hash, null);
+                signer.update(message);
+                const signature = try signer.finalize(sig_buf[0..MAX_SIGNATURE_LEN], rng);
+                return signature.bytes;
+            },
+            else => return error.TlsUnknownSignatureScheme,
+        }
+    }
+
+    /// Zappa 1b.23 Bug 1 chip — verify `signature` against `message`
+    /// using the leaf certificate's public key. Reuses the same
+    /// primitives as `CertificateParser.verifySignature`.
+    ///
+    /// Returns the underlying std.crypto verify error on bad signature.
+    pub fn verifySelfTest(
+        self: *const CertKeyPair,
+        message: []const u8,
+        signature: []const u8,
+    ) !void {
+        // Extract leaf DER from the bundle. The bundle bytes contain
+        // concatenated DER-encoded certs; the first element is the leaf.
+        const certs = self.bundle.bytes.items;
+        const leaf_elem = try Certificate.der.Element.parse(certs, 0);
+        const leaf_der = certs[0..leaf_elem.slice.end];
+
+        const parsed = try (Certificate{ .buffer = leaf_der, .index = 0 }).parse();
+        const pub_key = parsed.pubKey();
+        const pub_key_algo = parsed.pub_key_algo;
+
+        switch (self.key.signature_scheme) {
+            inline .ecdsa_secp256r1_sha256,
+            .ecdsa_secp384r1_sha384,
+            => |comptime_scheme| {
+                if (pub_key_algo != .X9_62_id_ecPublicKey) return error.TlsBadSignatureScheme;
+                const cert_named_curve = pub_key_algo.X9_62_id_ecPublicKey;
+                switch (cert_named_curve) {
+                    inline .secp384r1, .X9_62_prime256v1 => |comptime_cert_named_curve| {
+                        const Ecdsa = CertificateParser.SchemeEcdsaCert(comptime_scheme, comptime_cert_named_curve);
+                        const key = try Ecdsa.PublicKey.fromSec1(pub_key);
+                        const sig = try Ecdsa.Signature.fromDer(signature);
+                        try sig.verify(message, key);
+                    },
+                    else => return error.TlsUnknownSignatureScheme,
+                }
+            },
+            inline .rsa_pss_rsae_sha256,
+            .rsa_pss_rsae_sha384,
+            .rsa_pss_rsae_sha512,
+            => |comptime_scheme| {
+                if (pub_key_algo != .rsaEncryption) return error.TlsBadSignatureScheme;
+                const Hash = SchemeHash(comptime_scheme);
+                const pk = try rsa.PublicKey.fromDer(pub_key);
+                const sig = rsa.Pss(Hash).Signature{ .bytes = signature };
+                try sig.verify(message, pk, null);
+            },
+            else => return error.TlsUnknownSignatureScheme,
+        }
     }
 
     const EcdsaKeyPair = union(enum) {
@@ -480,7 +586,7 @@ pub const CertificateParser = struct {
         }
     }
 
-    fn SchemeEcdsaCert(comptime scheme: proto.SignatureScheme, comptime cert_named_curve: Certificate.NamedCurve) type {
+    pub fn SchemeEcdsaCert(comptime scheme: proto.SignatureScheme, comptime cert_named_curve: Certificate.NamedCurve) type {
         const Sha256 = crypto.hash.sha2.Sha256;
         const Sha384 = crypto.hash.sha2.Sha384;
         const Ecdsa = crypto.sign.ecdsa.Ecdsa;
@@ -760,4 +866,42 @@ test "CertificateParser: chain_der_storage null preserves back-compat (no captur
     try testing.expect(parser.leaf_der != null);
     // No storage was provided → no per-slice capture happened.
     try testing.expectEqual(@as(?[]?[]const u8, null), parser.chain_der_storage);
+}
+
+test "1b.23 Bug 1 chip — CertKeyPair.signSelfTest + verifySelfTest round-trip (ECDSA P-256)" {
+    const alloc = testing.allocator;
+    const cert_pem = @embedFile("testdata/mtls_test_cert.pem");
+    const key_pem = @embedFile("testdata/mtls_test_key.pem");
+
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var pair = try CertKeyPair.fromSlice(alloc, io, cert_pem, key_pem);
+    defer pair.deinit(alloc);
+
+    const message = "test-vector";
+    var sig_buf: [MAX_SIGNATURE_LEN]u8 = undefined;
+    const sig = try pair.signSelfTest(message, &sig_buf, testu.random(0));
+    try pair.verifySelfTest(message, sig);
+}
+
+test "1b.23 Bug 1 chip — verifySelfTest rejects wrong message" {
+    const alloc = testing.allocator;
+    const cert_pem = @embedFile("testdata/mtls_test_cert.pem");
+    const key_pem = @embedFile("testdata/mtls_test_key.pem");
+
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var pair = try CertKeyPair.fromSlice(alloc, io, cert_pem, key_pem);
+    defer pair.deinit(alloc);
+
+    var sig_buf: [MAX_SIGNATURE_LEN]u8 = undefined;
+    const sig = try pair.signSelfTest("message-a", &sig_buf, testu.random(0));
+    // ECDSA verify over a wrong message produces an invalid-signature error.
+    // The exact error name may be SignatureVerificationFailed or similar.
+    const result = pair.verifySelfTest("message-b", sig);
+    try testing.expectError(error.SignatureVerificationFailed, result);
 }
