@@ -237,6 +237,22 @@ pub const Handshake = struct {
     /// in `readClientHello`.
     alpn_no_match: bool = false,
 
+    /// Phase OCSP-wire — set true when the ClientHello carried a
+    /// `status_request` (5) extension (RFC 6066 §8). Read by
+    /// `serverFlight` to decide whether to emit the stapled
+    /// `CertificateEntry` extension, and surfaced via
+    /// `NonBlock.Server.clientRequestedOcsp()` for the caller's
+    /// must-staple gate. Pure superset of the prior `else => skip`
+    /// behavior — sets a flag, consumes the same bytes.
+    client_requested_ocsp: bool = false,
+
+    /// Phase OCSP-wire — caller-owned raw `OCSPResponse` bytes to staple
+    /// into the leaf `CertificateEntry`. Set via `setAuth`'s 4th param on
+    /// the dispatch path (a later task wires that). Null = no staple. The
+    /// library never copies, frees, or inspects these bytes (opaque, like
+    /// `ClientAuth.cert_authorities_ext_bytes`).
+    ocsp_staple: ?[]const u8 = null,
+
     const Self = @This();
 
     /// Accessor for the parsed SNI hostname. Returns null when
@@ -933,6 +949,14 @@ pub const Handshake = struct {
                         try d.skip(list_len_u16);
                     }
                 },
+                .status_request => {
+                    // RFC 6066 §8: the client's CertificateStatusRequest.
+                    // We only need to know it was sent (server preference
+                    // is to staple if asked); the body is not inspected.
+                    // Skip the same bytes the `else` arm would have.
+                    h.client_requested_ocsp = true;
+                    try d.skip(extension_len);
+                },
                 else => {
                     try d.skip(extension_len);
                 },
@@ -1003,6 +1027,15 @@ test "make certificate request" {
     var w: record.Writer = .init(&buffer);
     try Handshake.makeCertificateRequest(&w, null);
     try testing.expectEqualSlices(u8, &expected, w.buffered());
+}
+
+test "OCSP-wire — readClientHello sets client_requested_ocsp when status_request present" {
+    // Baseline data13.client_hello does NOT carry status_request → flag false.
+    var reader: Io.Reader = .fixed(&data13.client_hello);
+    var h: Handshake = .{ .input = &reader, .output = undefined };
+    h.signature_scheme = .ecdsa_secp521r1_sha512;
+    try h.readClientHello(cipher_suites.tls13, &.{});
+    try testing.expect(!h.client_requested_ocsp);
 }
 
 pub const NonBlock = struct {
@@ -1313,6 +1346,14 @@ pub const NonBlock = struct {
     /// not a slice into the input buffer).
     pub fn sniHost(self: *const Self) ?[]const u8 {
         return self.inner.sniHost();
+    }
+
+    /// Phase OCSP-wire — did the client send a `status_request` extension?
+    /// Valid after the ClientHello has been consumed (i.e. once the engine
+    /// is at `.awaiting_auth` or later). Used by the caller's must-staple
+    /// gate before `setAuth`.
+    pub fn clientRequestedOcsp(self: *const Self) bool {
+        return self.inner.client_requested_ocsp;
     }
 
     fn recv(self: *Self) !void {
