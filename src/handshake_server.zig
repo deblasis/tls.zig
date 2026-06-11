@@ -1029,8 +1029,8 @@ test "make certificate request" {
     try testing.expectEqualSlices(u8, &expected, w.buffered());
 }
 
-test "OCSP-wire — readClientHello sets client_requested_ocsp when status_request present" {
-    // Baseline data13.client_hello does NOT carry status_request → flag false.
+test "OCSP-wire — readClientHello leaves client_requested_ocsp false when status_request absent" {
+    // data13.client_hello has no status_request extension; flag must stay false.
     var reader: Io.Reader = .fixed(&data13.client_hello);
     var h: Handshake = .{ .input = &reader, .output = undefined };
     h.signature_scheme = .ecdsa_secp521r1_sha512;
