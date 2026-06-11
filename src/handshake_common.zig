@@ -295,6 +295,13 @@ pub const cert = struct {
     }
 };
 
+/// RFC 6066 status_request extension type.
+const ext_type_status_request: u16 = 5;
+/// Max OCSP staple that fits a u16 TLS extension length:
+/// exts_total = ext_type(2)+ext_len(2)+status_type(1)+u24(3)+N must be ≤ 65535,
+/// so N ≤ 65535 − 8 = 65527.
+const ocsp_staple_max_len: usize = std.math.maxInt(u16) - 8;
+
 pub const CertificateBuilder = struct {
     /// Caller-owned cert/key bundle to serialize. Read-only — the
     /// builder only inspects bundle bytes + signature schemes; it never
@@ -335,32 +342,26 @@ pub const CertificateBuilder = struct {
         //     }
         //   }
         // Guard: a staple too large for a u16 extension length (exts_total
-        // = 8 + N must fit u16 → N <= 65527) degrades to "no staple".
-        var leaf_ext_buf: [9]u8 = undefined;
-        const leaf_ext_header: ?[]const u8 = if (is_13 and h.ocsp_staple != null and h.ocsp_staple.?.len <= 65527) blk: {
-            const staple = h.ocsp_staple.?;
-            const ext_body_len: usize = 1 + 3 + staple.len; // status_type + u24 + body
-            const exts_total: usize = 2 + 2 + ext_body_len; // ext_type + ext_len + body
-            mem.writeInt(u16, leaf_ext_buf[0..2], @intCast(exts_total), .big);
-            mem.writeInt(u16, leaf_ext_buf[2..4], 5, .big); // status_request
-            mem.writeInt(u16, leaf_ext_buf[4..6], @intCast(ext_body_len), .big);
-            leaf_ext_buf[6] = 1; // status_type = ocsp
-            leaf_ext_buf[7] = @intCast((staple.len >> 16) & 0xff); // u24 high
-            leaf_ext_buf[8] = @intCast((staple.len >> 8) & 0xff); // u24 mid
-            // low u24 byte + staple body are emitted as slices in the loop.
-            break :blk leaf_ext_buf[0..9];
-        } else null;
-
-        const leaf_ext_total_len: usize = if (leaf_ext_header) |_|
-            9 + 1 + h.ocsp_staple.?.len // header(9) + low-len-byte(1) + staple
+        // = 8 + N must fit u16 → N <= ocsp_staple_max_len) degrades to "no staple".
+        const leaf_has_staple = is_13 and
+            h.ocsp_staple != null and
+            h.ocsp_staple.?.len <= ocsp_staple_max_len;
+        // Leaf extensions length: status_request wrapper when stapling,
+        // else the empty {0,0} (TLS 1.3) / nothing (TLS 1.2).
+        //   exts_total(2) + ext_type(2) + ext_len(2) + status_type(1)
+        //   + OCSPResponse u24(3) + staple(N) = 10 + N
+        const leaf_ext_total_len: usize = if (leaf_has_staple)
+            10 + h.ocsp_staple.?.len
         else
             empty_ext.len;
 
         // certs_len: each cert contributes 3 (length prefix) + its extensions.
         // The leaf may have larger extensions than the rest.
         const non_leaf_ext_total: usize = if (is_13) empty_ext.len else 0;
-        const certs_len = certs.len + 3 * certs_count + leaf_ext_total_len +
-            non_leaf_ext_total * (certs_count - 1);
+        // leaf extensions (cert_i == 0) + non-leaf extensions (remaining certs)
+        const certs_len = certs.len + 3 * certs_count +
+            leaf_ext_total_len + // cert_i == 0
+            non_leaf_ext_total * (certs_count - 1); // cert_i > 0
 
         try w.handshakeRecordHeader(.certificate, certs_len + request_context.len + 3);
         try w.slice(request_context);
@@ -373,10 +374,14 @@ pub const CertificateBuilder = struct {
             const crt = certs[index..e.slice.end];
             try w.int(u24, crt.len);
             try w.slice(crt);
-            if (cert_i == 0 and leaf_ext_header != null) {
-                try w.slice(leaf_ext_header.?);
+            if (cert_i == 0 and leaf_has_staple) {
                 const staple = h.ocsp_staple.?;
-                try w.slice(&[_]u8{@intCast(staple.len & 0xff)}); // u24 low
+                const ext_body_len: usize = 1 + 3 + staple.len; // status_type + u24 + body
+                try w.int(u16, 2 + 2 + ext_body_len);            // exts_total = 8 + N
+                try w.int(u16, ext_type_status_request);          // 0x0005
+                try w.int(u16, ext_body_len);                     // extension_len = 4 + N
+                try w.slice(&[_]u8{1});                           // status_type = ocsp
+                try w.int(u24, staple.len);                       // OCSPResponse length
                 try w.slice(staple);
             } else {
                 try w.slice(empty_ext);
@@ -989,7 +994,7 @@ test "OCSP-wire — makeCertificate stapled leaf CertificateEntry round-trips" {
 
     // Wire layout immediately before the staple (offsets relative to idx):
     //   idx-10: exts_total high (0x00)
-    //   idx-9:  exts_total low  (0x19 = 25)
+    //   idx-9:  exts_total low  (0x19 = 25 = 8+17)
     //   idx-8:  ext_type high   (0x00)
     //   idx-7:  ext_type low    (0x05 = status_request)
     //   idx-6:  ext_body_len high (0x00)
@@ -998,12 +1003,16 @@ test "OCSP-wire — makeCertificate stapled leaf CertificateEntry round-trips" {
     //   idx-3:  u24 high        (0x00)
     //   idx-2:  u24 mid         (0x00)
     //   idx-1:  u24 low         (0x11 = 17)
-    try testing.expectEqual(@as(u8, 0x00), out[idx - 8]); // ext_type high
-    try testing.expectEqual(@as(u8, 0x05), out[idx - 7]); // status_request type
-    try testing.expectEqual(@as(u8, 0x01), out[idx - 4]); // status_type = ocsp
-    try testing.expectEqual(@as(u8, 0x00), out[idx - 3]); // u24 high
-    try testing.expectEqual(@as(u8, 0x00), out[idx - 2]); // u24 mid
-    try testing.expectEqual(@as(u8, 0x11), out[idx - 1]); // u24 low = 17
+    try testing.expectEqual(@as(u8, 0x00), out[idx - 10]); // exts_total high
+    try testing.expectEqual(@as(u8, 0x19), out[idx - 9]);  // exts_total low = 25
+    try testing.expectEqual(@as(u8, 0x00), out[idx - 8]);  // ext_type high
+    try testing.expectEqual(@as(u8, 0x05), out[idx - 7]);  // status_request type
+    try testing.expectEqual(@as(u8, 0x00), out[idx - 6]);  // ext_body_len high
+    try testing.expectEqual(@as(u8, 0x15), out[idx - 5]);  // ext_body_len low = 21
+    try testing.expectEqual(@as(u8, 0x01), out[idx - 4]);  // status_type = ocsp
+    try testing.expectEqual(@as(u8, 0x00), out[idx - 3]);  // u24 high
+    try testing.expectEqual(@as(u8, 0x00), out[idx - 2]);  // u24 mid
+    try testing.expectEqual(@as(u8, 0x11), out[idx - 1]);  // u24 low = 17
 }
 
 test "OCSP-wire — makeCertificate without staple emits empty leaf extensions" {
