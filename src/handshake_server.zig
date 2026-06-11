@@ -247,10 +247,9 @@ pub const Handshake = struct {
     client_requested_ocsp: bool = false,
 
     /// Phase OCSP-wire — caller-owned raw `OCSPResponse` bytes to staple
-    /// into the leaf `CertificateEntry`. Set via `setAuth`'s 4th param on
-    /// the dispatch path (a later task wires that). Null = no staple. The
-    /// library never copies, frees, or inspects these bytes (opaque, like
-    /// `ClientAuth.cert_authorities_ext_bytes`).
+    /// into the leaf `CertificateEntry`. Set via `setAuth`'s 4th param.
+    /// Null = no staple. The library never copies, frees, or inspects these
+    /// bytes (opaque, like `ClientAuth.cert_authorities_ext_bytes`).
     ocsp_staple: ?[]const u8 = null,
 
     const Self = @This();
@@ -2996,7 +2995,7 @@ test "OCSP-wire — setAuth stores ocsp_staple; serverFlight gates on client_req
 
     // (b) client did not send status_request → flag must be false.
     try testing.expect(!srv.clientRequestedOcsp());
-    // inner is accessible via the public field — check invariant directly.
+    // Also check the raw field directly (same-file access).
     try testing.expect(!srv.inner.client_requested_ocsp);
 
     // (a) Supply staple via the new 4th param.
