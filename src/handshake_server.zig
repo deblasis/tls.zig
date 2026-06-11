@@ -237,6 +237,21 @@ pub const Handshake = struct {
     /// in `readClientHello`.
     alpn_no_match: bool = false,
 
+    /// Phase OCSP-wire — set true when the ClientHello carried a
+    /// `status_request` (5) extension (RFC 6066 §8). Read by
+    /// `serverFlight` to decide whether to emit the stapled
+    /// `CertificateEntry` extension, and surfaced via
+    /// `NonBlock.Server.clientRequestedOcsp()` for the caller's
+    /// must-staple gate. Pure superset of the prior `else => skip`
+    /// behavior — sets a flag, consumes the same bytes.
+    client_requested_ocsp: bool = false,
+
+    /// Phase OCSP-wire — caller-owned raw `OCSPResponse` bytes to staple
+    /// into the leaf `CertificateEntry`. Set via `setAuth`'s 4th param.
+    /// Null = no staple. The library never copies, frees, or inspects these
+    /// bytes (opaque, like `ClientAuth.cert_authorities_ext_bytes`).
+    ocsp_staple: ?[]const u8 = null,
+
     const Self = @This();
 
     /// Accessor for the parsed SNI hostname. Returns null when
@@ -427,6 +442,10 @@ pub const Handshake = struct {
                 .cert_key_pair = auth,
                 .transcript = &h.transcript,
                 .side = .server,
+                // Phase OCSP-wire — staple only if the client asked AND a
+                // staple was supplied via setAuth. Null otherwise → empty
+                // leaf extensions (bit-identical legacy).
+                .ocsp_staple = if (h.client_requested_ocsp) h.ocsp_staple else null,
             };
             { // Certificate
                 var hw = try w.writerAdvance(record.header_len);
@@ -933,6 +952,14 @@ pub const Handshake = struct {
                         try d.skip(list_len_u16);
                     }
                 },
+                .status_request => {
+                    // RFC 6066 §8: the client's CertificateStatusRequest.
+                    // We only need to know it was sent (server preference
+                    // is to staple if asked); the body is not inspected.
+                    // Skip the same bytes the `else` arm would have.
+                    h.client_requested_ocsp = true;
+                    try d.skip(extension_len);
+                },
                 else => {
                     try d.skip(extension_len);
                 },
@@ -1003,6 +1030,15 @@ test "make certificate request" {
     var w: record.Writer = .init(&buffer);
     try Handshake.makeCertificateRequest(&w, null);
     try testing.expectEqualSlices(u8, &expected, w.buffered());
+}
+
+test "OCSP-wire — readClientHello leaves client_requested_ocsp false when status_request absent" {
+    // data13.client_hello has no status_request extension; flag must stay false.
+    var reader: Io.Reader = .fixed(&data13.client_hello);
+    var h: Handshake = .{ .input = &reader, .output = undefined };
+    h.signature_scheme = .ecdsa_secp521r1_sha512;
+    try h.readClientHello(cipher_suites.tls13, &.{});
+    try testing.expect(!h.client_requested_ocsp);
 }
 
 pub const NonBlock = struct {
@@ -1090,16 +1126,27 @@ pub const NonBlock = struct {
     ///                       preserves the selection already made during
     ///                       `readClientHello` (backward-compatible).
     ///
+    ///   `ocsp_staple`     — Phase OCSP-wire. When non-null, a raw
+    ///                       `OCSPResponse` DER blob to staple into the
+    ///                       leaf `CertificateEntry` (RFC 6066 §8 /
+    ///                       RFC 8446 §4.4.2). The library never copies,
+    ///                       frees, or inspects these bytes; the caller
+    ///                       owns the lifetime. The staple is emitted ONLY
+    ///                       when the client also requested OCSP via
+    ///                       `status_request`; if the client did not
+    ///                       request it the bytes are ignored. Null = no
+    ///                       staple.
+    ///
     /// Idempotency: when called a second time after `auth_resolved` is set,
-    /// re-stamps `cert_key_pair` and returns. `client_auth` and `alpn_protocols`
-    /// from the second call are intentionally ignored — only the cert pointer
-    /// updates. This protects against any future state-machine bug that
+    /// re-stamps `cert_key_pair` and `ocsp_staple`; other params ignored.
+    /// This protects against any future state-machine bug that
     /// re-enters `.awaiting_auth` after a valid resolution.
     pub fn setAuth(
         self: *Self,
         cert_key_pair: *const CertKeyPair,
         client_auth: ?ClientAuth,
         alpn_protocols: ?[]const []const u8,
+        ocsp_staple: ?[]const u8,
     ) void {
         // Idempotency guard: if we've already resolved auth (e.g. a buggy
         // double-call) re-stamp the cert but leave everything else alone.
@@ -1107,10 +1154,12 @@ pub const NonBlock = struct {
         // true the handshake proceeds unconditionally on the next run().
         if (self.inner.auth_resolved) {
             self.inner.opt_auth = cert_key_pair;
+            self.inner.ocsp_staple = ocsp_staple;
             return;
         }
 
         self.inner.opt_auth = cert_key_pair;
+        self.inner.ocsp_staple = ocsp_staple;
 
         // Per-host client_auth override — applied BEFORE serverFlight
         // consults `opt.client_auth` to decide whether to emit
@@ -1313,6 +1362,14 @@ pub const NonBlock = struct {
     /// not a slice into the input buffer).
     pub fn sniHost(self: *const Self) ?[]const u8 {
         return self.inner.sniHost();
+    }
+
+    /// Phase OCSP-wire — did the client send a `status_request` extension?
+    /// Valid after the ClientHello has been consumed (i.e. once the engine
+    /// is at `.awaiting_auth` or later). Used by the caller's must-staple
+    /// gate before `setAuth`.
+    pub fn clientRequestedOcsp(self: *const Self) bool {
+        return self.inner.client_requested_ocsp;
     }
 
     fn recv(self: *Self) !void {
@@ -2037,7 +2094,7 @@ test "sniHost survives across awaiting_auth pause" {
     try testing.expectEqualStrings(expected_sni, sni_second.?);
 
     // Resolve via setAuth (null new params = preserve Options defaults).
-    srv.setAuth(&server_auth, null, null);
+    srv.setAuth(&server_auth, null, null, null);
     try testing.expectEqual(NonBlock.RunState.in_progress, srv.runState());
 
     var rounds: usize = 0;
@@ -2115,7 +2172,7 @@ test "setAuth swaps server cert during handshake" {
     cs_len = 0;
 
     // Resolve (null new params = preserve Options defaults).
-    srv.setAuth(&swap_auth, null, null);
+    srv.setAuth(&swap_auth, null, null, null);
 
     // Drive to completion.
     var rounds: usize = 0;
@@ -2324,7 +2381,7 @@ test "setAuth(cert, null, null) preserves Options defaults (backward-compat)" {
     try testing.expectEqual(NonBlock.RunState.awaiting_auth, srv.runState());
 
     // Resolve — null for both new params: preserves Options defaults.
-    srv.setAuth(&server_auth, null, null);
+    srv.setAuth(&server_auth, null, null, null);
     try testing.expectEqual(NonBlock.RunState.in_progress, srv.runState());
 
     // Drive to completion.
@@ -2386,7 +2443,7 @@ test "setAuth(cert, null, alpn_override) selects ALPN from per-host override lis
     try testing.expectEqual(NonBlock.RunState.awaiting_auth, srv.runState());
 
     // Override: this host only supports "http/1.1".
-    srv.setAuth(&server_auth, null, &.{"http/1.1"});
+    srv.setAuth(&server_auth, null, &.{"http/1.1"}, null);
 
     try driveHandshake(&cli, &srv, 12);
     try testing.expect(srv.done());
@@ -2450,7 +2507,7 @@ test "setAuth(cert, ClientAuth{...}, null) causes server to emit CertificateRequ
     srv.setAuth(&server_auth, .{
         .root_ca = root_ca,
         .auth_type = .require,
-    }, null);
+    }, null, null);
 
     try driveHandshake(&cli, &srv, 12);
     try testing.expect(srv.done());
@@ -2509,7 +2566,7 @@ test "setAuth with non-overlapping ALPN override emits no_application_protocol e
     try testing.expectEqual(NonBlock.RunState.awaiting_auth, srv.runState());
 
     // Override: this host only accepts "h2" — but the client didn't offer it.
-    srv.setAuth(&server_auth, null, &.{"h2"});
+    srv.setAuth(&server_auth, null, &.{"h2"}, null);
 
     // The next run() should fail with TlsNoApplicationProtocol because the
     // per-host override has no overlap with the client's offer.
@@ -2559,11 +2616,11 @@ test "setAuth is idempotent — second call restamps cert, preserves first resol
     try testing.expectEqual(NonBlock.RunState.awaiting_auth, srv.runState());
 
     // First call — resolves auth.
-    srv.setAuth(&server_auth, null, null);
+    srv.setAuth(&server_auth, null, null, null);
     try testing.expectEqual(NonBlock.RunState.in_progress, srv.runState());
 
     // Second call — must be a no-op / restamp; must NOT panic or corrupt state.
-    srv.setAuth(&server_auth, null, null);
+    srv.setAuth(&server_auth, null, null, null);
     // State must still be in_progress (not re-paused or corrupted).
     try testing.expectEqual(NonBlock.RunState.in_progress, srv.runState());
 
@@ -2707,7 +2764,7 @@ test "setAuth applies cert + client_auth + alpn atomically before next run()" {
     srv.setAuth(&server_auth, .{
         .root_ca = root_ca,
         .auth_type = .require,
-    }, &.{"h2"});
+    }, &.{"h2"}, null);
 
     try driveHandshake(&cli, &srv, 12);
     try testing.expect(srv.done());
@@ -2871,7 +2928,7 @@ test "Phase 1b.25 — setAuth with cert_authorities_ext_bytes threads through to
         .root_ca = root_ca,
         .auth_type = .require,
         .cert_authorities_ext_bytes = payload[0..],
-    }, null);
+    }, null, null);
 
     try driveHandshake(&cli, &srv, 12);
     try testing.expect(srv.done());
@@ -2880,4 +2937,79 @@ test "Phase 1b.25 — setAuth with cert_authorities_ext_bytes threads through to
     // processed successfully and the client responded with its certificate.
     try testing.expect(srv.peerCertificate() != null);
     try testing.expect(srv.peerCertificate().?.len > 0);
+}
+
+// =====================================================================
+// Phase OCSP-wire — setAuth 4th param + serverFlight gate
+// =====================================================================
+
+test "OCSP-wire — setAuth stores ocsp_staple; serverFlight gates on client_requested_ocsp" {
+    // Construct an SNI-dispatch server. Drive client to emit ClientHello
+    // (no status_request) so the server reaches awaiting_auth. Then:
+    //   (a) call setAuth with a non-null ocsp_staple — verify it lands in
+    //       inner.ocsp_staple.
+    //   (b) verify client_requested_ocsp is false (no status_request in
+    //       ClientHello) — the gate that serverFlight uses.
+    //   (c) complete the handshake successfully (staple ignored because
+    //       client did not ask; wire is bit-identical legacy).
+    // This pins the "4th param lands in inner.ocsp_staple" invariant and
+    // validates the gate without requiring a live OCSP fetch.
+    const alloc = testing.allocator;
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const now = std.Io.Clock.real.now(io);
+    const rng_impl: std.Random.IoSource = .{ .io = io };
+    const rng = rng_impl.interface();
+
+    var server_auth = try common.CertKeyPair.fromSlice(alloc, io, mtls_test_cert_pem, mtls_test_key_pem);
+    defer server_auth.deinit(alloc);
+    var root_ca = try cert.fromSlice(alloc, io, mtls_test_cert_pem);
+    defer root_ca.deinit(alloc);
+
+    // Client does NOT set request_ocsp — status_request extension is absent.
+    var cli = handshake_client_mod.NonBlock.init(.{
+        .rng = rng,
+        .root_ca = root_ca,
+        .host = "test.local",
+        .insecure_skip_verify = true,
+        .now = now,
+    });
+    var srv = NonBlock.initForSniDispatch(.{
+        .rng = rng,
+        .auth = null,
+        .now = now,
+    }, null);
+
+    var cs_buf: [max_ciphertext_record_len]u8 = undefined;
+    var sc_buf: [max_ciphertext_record_len]u8 = undefined;
+    var cs_len: usize = 0;
+
+    // Client emits ClientHello (no status_request).
+    const cr1 = try cli.run(&sc_buf, &cs_buf);
+    cs_len = cr1.send.len;
+
+    // Server pauses at awaiting_auth.
+    _ = try srv.run(cs_buf[0..cs_len], &sc_buf);
+    try testing.expectEqual(NonBlock.RunState.awaiting_auth, srv.runState());
+
+    // (b) client did not send status_request → flag must be false.
+    try testing.expect(!srv.clientRequestedOcsp());
+    // Also check the raw field directly (same-file access).
+    try testing.expect(!srv.inner.client_requested_ocsp);
+
+    // (a) Supply staple via the new 4th param.
+    const staple: []const u8 = "OCSP-STAPLE-BYTES";
+    srv.setAuth(&server_auth, null, null, staple);
+    try testing.expectEqual(NonBlock.RunState.in_progress, srv.runState());
+
+    // Verify the staple landed in inner.ocsp_staple.
+    try testing.expect(srv.inner.ocsp_staple != null);
+    try testing.expectEqualStrings(staple, srv.inner.ocsp_staple.?);
+
+    // (c) Drive to completion — staple not emitted (client didn't ask),
+    //     but the handshake must still succeed bit-identically.
+    try driveHandshake(&cli, &srv, 12);
+    try testing.expect(cli.done());
+    try testing.expect(srv.done());
 }

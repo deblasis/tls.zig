@@ -62,6 +62,12 @@ pub const Options = struct {
     /// If empty, no ALPN extension is sent.
     alpn_protocols: []const []const u8 = &.{},
 
+    /// Phase OCSP-wire — when true, the ClientHello carries an (empty)
+    /// status_request extension (RFC 6066 §8) so the server staples its
+    /// OCSP response into the leaf CertificateEntry. Default false =
+    /// bit-identical (no extension emitted).
+    request_ocsp: bool = false,
+
     /// Client authentication certificates and private key. Pointer is
     /// read-only — the library never mutates the underlying
     /// `CertKeyPair`.
@@ -478,6 +484,18 @@ pub const Handshake = struct {
         try w.serverName(opt.host);
         if (opt.alpn_protocols.len > 0) {
             try w.alpn(opt.alpn_protocols);
+        }
+        if (opt.request_ocsp) {
+            // CertificateStatusRequest (RFC 6066 §8):
+            //   extension_type = status_request (0x0005)
+            //   extension_data_len = 5
+            //   status_type = ocsp (1)
+            //   responder_id_list length = 0 (u16)
+            //   request_extensions length = 0 (u16)
+            // Wire: 00 05  00 05  01 00 00 00 00
+            try w.enumValue(proto.Extension.status_request);
+            try w.int(u16, 5); // extension data length
+            try w.slice(&[_]u8{ 1, 0, 0, 0, 0 });
         }
         // binder key placeholder
         const binder_pos: ?usize = if (resumption_ticket) |ticket| brk: {

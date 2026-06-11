@@ -295,6 +295,13 @@ pub const cert = struct {
     }
 };
 
+/// RFC 6066 status_request extension type.
+const ext_type_status_request: u16 = 5;
+/// Max OCSP staple that fits a u16 TLS extension length:
+/// exts_total = ext_type(2)+ext_len(2)+status_type(1)+u24(3)+N must be ≤ 65535,
+/// so N ≤ 65535 − 8 = 65527.
+const ocsp_staple_max_len: usize = std.math.maxInt(u16) - 8;
+
 pub const CertificateBuilder = struct {
     /// Caller-owned cert/key bundle to serialize. Read-only — the
     /// builder only inspects bundle bytes + signature schemes; it never
@@ -306,34 +313,79 @@ pub const CertificateBuilder = struct {
     tls_version: proto.Version = .tls_1_3,
     side: proto.Side = .client,
     rng: std.Random,
+    /// Phase OCSP-wire — raw `OCSPResponse` bytes to staple into the LEAF
+    /// `CertificateEntry`'s extensions (TLS 1.3 only; RFC 8446 §4.4.2.1).
+    /// Null = no staple (empty extensions, bit-identical legacy). Caller-
+    /// owned + opaque; never freed or inspected here. The caller
+    /// (serverFlight) gates this on `client_requested_ocsp`.
+    ocsp_staple: ?[]const u8 = null,
 
     pub fn makeCertificate(h: CertificateBuilder, w: *record.Writer) !void {
         const certs = h.cert_key_pair.bundle.bytes.items;
         const certs_count = h.cert_key_pair.bundle.map.size;
 
-        // Differences between tls 1.3 and 1.2
-        // TLS 1.3 has request context in header and extensions for each certificate.
-        // Here we use empty length for each field.
-        // TLS 1.2 don't have these two fields.
-        const request_context, const extensions = if (h.tls_version == .tls_1_3)
-            .{ &[_]u8{0}, &[_]u8{ 0, 0 } }
-        else
-            .{ &[_]u8{}, &[_]u8{} };
-        const certs_len = certs.len + (3 + extensions.len) * certs_count;
+        // TLS 1.3 has request context in header and extensions for each
+        // certificate; TLS 1.2 has neither.
+        const is_13 = h.tls_version == .tls_1_3;
+        const request_context: []const u8 = if (is_13) &[_]u8{0} else &[_]u8{};
+        const empty_ext: []const u8 = if (is_13) &[_]u8{ 0, 0 } else &[_]u8{};
 
-        // Write handshake header
+        // Phase OCSP-wire — the LEAF (first) cert carries a status_request
+        // CertificateEntry extension when a staple is present (TLS 1.3
+        // only). Wire (RFC 8446 §4.4.2.1 + RFC 6066 §8):
+        //   extensions<u16 total> {
+        //     extension_type = 5 (status_request)   // u16
+        //     extension_len                          // u16
+        //     CertificateStatus {
+        //       status_type = 1 (ocsp)               // u8
+        //       OCSPResponse<u24 len> = <staple>     // u24 + N
+        //     }
+        //   }
+        // Guard: a staple too large for a u16 extension length (exts_total
+        // = 8 + N must fit u16 → N <= ocsp_staple_max_len) degrades to "no staple".
+        const leaf_has_staple = is_13 and
+            h.ocsp_staple != null and
+            h.ocsp_staple.?.len <= ocsp_staple_max_len;
+        // Leaf extensions length: status_request wrapper when stapling,
+        // else the empty {0,0} (TLS 1.3) / nothing (TLS 1.2).
+        //   exts_total(2) + ext_type(2) + ext_len(2) + status_type(1)
+        //   + OCSPResponse u24(3) + staple(N) = 10 + N
+        const leaf_ext_total_len: usize = if (leaf_has_staple)
+            10 + h.ocsp_staple.?.len
+        else
+            empty_ext.len;
+
+        // certs_len: each cert contributes 3 (length prefix) + its extensions.
+        // The leaf may have larger extensions than the rest.
+        const non_leaf_ext_total: usize = if (is_13) empty_ext.len else 0;
+        // leaf extensions (cert_i == 0) + non-leaf extensions (remaining certs)
+        const certs_len = certs.len + 3 * certs_count +
+            leaf_ext_total_len + // cert_i == 0
+            non_leaf_ext_total * (certs_count - 1); // cert_i > 0
+
         try w.handshakeRecordHeader(.certificate, certs_len + request_context.len + 3);
         try w.slice(request_context);
         try w.int(u24, certs_len);
 
-        // Write each certificate
         var index: u32 = 0;
-        while (index < certs.len) {
+        var cert_i: usize = 0;
+        while (index < certs.len) : (cert_i += 1) {
             const e = try Certificate.der.Element.parse(certs, index);
             const crt = certs[index..e.slice.end];
-            try w.int(u24, crt.len); // certificate length
-            try w.slice(crt); // certificate
-            try w.slice(extensions); // certificate extensions
+            try w.int(u24, crt.len);
+            try w.slice(crt);
+            if (cert_i == 0 and leaf_has_staple) {
+                const staple = h.ocsp_staple.?;
+                const ext_body_len: usize = 1 + 3 + staple.len; // status_type + u24 + body
+                try w.int(u16, 2 + 2 + ext_body_len);            // exts_total = 8 + N
+                try w.int(u16, ext_type_status_request);          // 0x0005
+                try w.int(u16, ext_body_len);                     // extension_len = 4 + N
+                try w.slice(&[_]u8{1});                           // status_type = ocsp
+                try w.int(u24, staple.len);                       // OCSPResponse length
+                try w.slice(staple);
+            } else {
+                try w.slice(empty_ext);
+            }
             index = e.slice.end;
         }
     }
@@ -904,4 +956,97 @@ test "1b.23 Bug 1 chip — verifySelfTest rejects wrong message" {
     // The exact error name may be SignatureVerificationFailed or similar.
     const result = pair.verifySelfTest("message-b", sig);
     try testing.expectError(error.SignatureVerificationFailed, result);
+}
+
+test "OCSP-wire — makeCertificate stapled leaf CertificateEntry round-trips" {
+    const alloc = testing.allocator;
+    const cert_pem = @embedFile("testdata/mtls_test_cert.pem");
+    const key_pem = @embedFile("testdata/mtls_test_key.pem");
+
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var ckp = try CertKeyPair.fromSlice(alloc, io, cert_pem, key_pem);
+    defer ckp.deinit(alloc);
+
+    var transcript: Transcript = .{};
+    const staple = "OCSPRESPONSEBYTES"; // 17 bytes
+    var buf: [4096]u8 = undefined;
+    var w: record.Writer = .init(&buf);
+
+    const cb = CertificateBuilder{
+        .cert_key_pair = &ckp,
+        .transcript = &transcript,
+        .tls_version = .tls_1_3,
+        .side = .server,
+        .rng = testu.random(0),
+        .ocsp_staple = staple,
+    };
+    try cb.makeCertificate(&w);
+    const out = w.buffered();
+
+    // Handshake type byte must be certificate (0x0b = 11).
+    try testing.expectEqual(@as(u8, 11), out[0]);
+
+    // The raw staple bytes must appear verbatim somewhere in the output.
+    const idx = std.mem.indexOf(u8, out, staple) orelse return error.StapleNotFound;
+
+    // Wire layout immediately before the staple (offsets relative to idx):
+    //   idx-10: exts_total high (0x00)
+    //   idx-9:  exts_total low  (0x19 = 25 = 8+17)
+    //   idx-8:  ext_type high   (0x00)
+    //   idx-7:  ext_type low    (0x05 = status_request)
+    //   idx-6:  ext_body_len high (0x00)
+    //   idx-5:  ext_body_len low  (0x15 = 21 = 1+3+17)
+    //   idx-4:  status_type     (0x01 = ocsp)
+    //   idx-3:  u24 high        (0x00)
+    //   idx-2:  u24 mid         (0x00)
+    //   idx-1:  u24 low         (0x11 = 17)
+    try testing.expectEqual(@as(u8, 0x00), out[idx - 10]); // exts_total high
+    try testing.expectEqual(@as(u8, 0x19), out[idx - 9]);  // exts_total low = 25
+    try testing.expectEqual(@as(u8, 0x00), out[idx - 8]);  // ext_type high
+    try testing.expectEqual(@as(u8, 0x05), out[idx - 7]);  // status_request type
+    try testing.expectEqual(@as(u8, 0x00), out[idx - 6]);  // ext_body_len high
+    try testing.expectEqual(@as(u8, 0x15), out[idx - 5]);  // ext_body_len low = 21
+    try testing.expectEqual(@as(u8, 0x01), out[idx - 4]);  // status_type = ocsp
+    try testing.expectEqual(@as(u8, 0x00), out[idx - 3]);  // u24 high
+    try testing.expectEqual(@as(u8, 0x00), out[idx - 2]);  // u24 mid
+    try testing.expectEqual(@as(u8, 0x11), out[idx - 1]);  // u24 low = 17
+}
+
+test "OCSP-wire — makeCertificate without staple emits empty leaf extensions" {
+    const alloc = testing.allocator;
+    const cert_pem = @embedFile("testdata/mtls_test_cert.pem");
+    const key_pem = @embedFile("testdata/mtls_test_key.pem");
+
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var ckp = try CertKeyPair.fromSlice(alloc, io, cert_pem, key_pem);
+    defer ckp.deinit(alloc);
+
+    var transcript: Transcript = .{};
+    var buf: [4096]u8 = undefined;
+    var w: record.Writer = .init(&buf);
+
+    const cb = CertificateBuilder{
+        .cert_key_pair = &ckp,
+        .transcript = &transcript,
+        .tls_version = .tls_1_3,
+        .side = .server,
+        .rng = testu.random(0),
+        .ocsp_staple = null,
+    };
+    try cb.makeCertificate(&w);
+    const out = w.buffered();
+
+    // Wire layout: header(4) + reqctx(1) + certs_len(3) + leaf_len(3) + leaf_DER
+    // out[8..11] = u24 leaf_len
+    const leaf_len = (@as(usize, out[8]) << 16) | (@as(usize, out[9]) << 8) | out[10];
+    const ext_off = 11 + leaf_len;
+    // Empty extensions = two zero bytes.
+    try testing.expectEqual(@as(u8, 0), out[ext_off]);
+    try testing.expectEqual(@as(u8, 0), out[ext_off + 1]);
 }
