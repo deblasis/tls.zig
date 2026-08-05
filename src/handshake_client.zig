@@ -62,8 +62,10 @@ pub const Options = struct {
     /// If empty, no ALPN extension is sent.
     alpn_protocols: []const []const u8 = &.{},
 
-    /// Client authentication certificates and private key.
-    auth: ?*CertKeyPair = null,
+    /// Client authentication certificates and private key. Pointer is
+    /// read-only — the library never mutates the underlying
+    /// `CertKeyPair`.
+    auth: ?*const CertKeyPair = null,
 
     /// If this structure is provided it will be filled with handshake attributes
     /// at the end of the handshake process.
@@ -784,7 +786,7 @@ pub const Handshake = struct {
     /// finished messages for tls 1.2.
     /// If client certificate is requested also adds client certificate and
     /// certificate verify messages.
-    fn makeClientFlight2Tls12(h: *Self, auth: ?*CertKeyPair, rng: std.Random) !void {
+    fn makeClientFlight2Tls12(h: *Self, auth: ?*const CertKeyPair, rng: std.Random) !void {
         var w: record.Writer = .initFromIo(h.output);
         var cert_builder: ?CertificateBuilder = null;
 
@@ -851,7 +853,7 @@ pub const Handshake = struct {
     /// and client certificate verify messages are also created. If the
     /// server has requested certificate but the client is not configured
     /// empty certificate message is sent, as is required by rfc.
-    fn makeClientFlight2Tls13(h: *Self, auth: ?*CertKeyPair, rng: std.Random) !void {
+    fn makeClientFlight2Tls13(h: *Self, auth: ?*const CertKeyPair, rng: std.Random) !void {
         var w: record.Writer = .initFromIo(h.output);
 
         // Client change cipher spec
@@ -891,7 +893,7 @@ pub const Handshake = struct {
         h.output.advance(w.buffered().len);
     }
 
-    fn certificateBuilder(h: *Self, auth: *CertKeyPair, rng: std.Random) CertificateBuilder {
+    fn certificateBuilder(h: *Self, auth: *const CertKeyPair, rng: std.Random) CertificateBuilder {
         return .{
             .rng = rng,
             .cert_key_pair = auth,

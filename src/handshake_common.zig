@@ -16,6 +16,12 @@ const EcdsaP256Sha256 = crypto.sign.ecdsa.EcdsaP256Sha256;
 const EcdsaP384Sha384 = crypto.sign.ecdsa.EcdsaP384Sha384;
 const MLKem768 = crypto.kem.ml_kem.MLKem768;
 
+/// Zappa 1b.23 Bug 1 chip — conservative upper bound on signature size
+/// across supported schemes. ECDSA DER: ~104 bytes (P-384). RSA-PSS:
+/// up to 512 bytes (4096-bit modulus). Caller-provided sig_buf for
+/// `CertKeyPair.signSelfTest` must be at least this large.
+pub const MAX_SIGNATURE_LEN: usize = 512;
+
 pub const supported_signature_algorithms = &[_]proto.SignatureScheme{
     .ecdsa_secp256r1_sha256,
     .ecdsa_secp384r1_sha384,
@@ -99,6 +105,106 @@ pub const CertKeyPair = struct {
 
     pub fn deinit(c: *CertKeyPair, allocator: mem.Allocator) void {
         c.bundle.deinit(allocator);
+    }
+
+    /// Zappa 1b.23 Bug 1 chip — sign `message` using the parsed
+    /// private key. Reuses the same primitives as
+    /// `CertificateBuilder.makeCertificateVerify` (ECDSA via
+    /// std.crypto signer chain; RSA-PSS via signerOaep).
+    ///
+    /// Writes the encoded signature bytes into `sig_buf` and returns
+    /// a slice of the bytes used. `sig_buf` must be at least
+    /// `MAX_SIGNATURE_LEN` bytes.
+    ///
+    /// `rng` is required for RSA-PSS (probabilistic). For ECDSA the
+    /// signer is deterministic per std.crypto's API; `rng` is ignored
+    /// on the ECDSA path.
+    pub fn signSelfTest(
+        self: *const CertKeyPair,
+        message: []const u8,
+        sig_buf: []u8,
+        rng: std.Random,
+    ) ![]const u8 {
+        if (sig_buf.len < MAX_SIGNATURE_LEN) return error.SignatureBufferTooSmall;
+        switch (self.key.signature_scheme) {
+            inline .ecdsa_secp256r1_sha256,
+            .ecdsa_secp384r1_sha384,
+            => |comptime_scheme| {
+                const Ecdsa = SchemeEcdsa(comptime_scheme);
+                const key_pair = switch (comptime_scheme) {
+                    .ecdsa_secp256r1_sha256 => self.ecdsa_key_pair.?.ecdsa_secp256r1_sha256,
+                    .ecdsa_secp384r1_sha384 => self.ecdsa_key_pair.?.ecdsa_secp384r1_sha384,
+                    else => unreachable,
+                };
+                var signer = try key_pair.signer(null);
+                signer.update(message);
+                const signature = try signer.finalize();
+                const der_len = Ecdsa.Signature.der_encoded_length_max;
+                const sig_der = signature.toDer(sig_buf[0..der_len]);
+                return sig_der;
+            },
+            inline .rsa_pss_rsae_sha256,
+            .rsa_pss_rsae_sha384,
+            .rsa_pss_rsae_sha512,
+            => |comptime_scheme| {
+                const Hash = SchemeHash(comptime_scheme);
+                var signer = try self.key.key.rsa.signerOaep(Hash, null);
+                signer.update(message);
+                const signature = try signer.finalize(sig_buf[0..MAX_SIGNATURE_LEN], rng);
+                return signature.bytes;
+            },
+            else => return error.TlsUnknownSignatureScheme,
+        }
+    }
+
+    /// Zappa 1b.23 Bug 1 chip — verify `signature` against `message`
+    /// using the leaf certificate's public key. Reuses the same
+    /// primitives as `CertificateParser.verifySignature`.
+    ///
+    /// Returns the underlying std.crypto verify error on bad signature.
+    pub fn verifySelfTest(
+        self: *const CertKeyPair,
+        message: []const u8,
+        signature: []const u8,
+    ) !void {
+        // Extract leaf DER from the bundle. The bundle bytes contain
+        // concatenated DER-encoded certs; the first element is the leaf.
+        const certs = self.bundle.bytes.items;
+        const leaf_elem = try Certificate.der.Element.parse(certs, 0);
+        const leaf_der = certs[0..leaf_elem.slice.end];
+
+        const parsed = try (Certificate{ .buffer = leaf_der, .index = 0 }).parse();
+        const pub_key = parsed.pubKey();
+        const pub_key_algo = parsed.pub_key_algo;
+
+        switch (self.key.signature_scheme) {
+            inline .ecdsa_secp256r1_sha256,
+            .ecdsa_secp384r1_sha384,
+            => |comptime_scheme| {
+                if (pub_key_algo != .X9_62_id_ecPublicKey) return error.TlsBadSignatureScheme;
+                const cert_named_curve = pub_key_algo.X9_62_id_ecPublicKey;
+                switch (cert_named_curve) {
+                    inline .secp384r1, .X9_62_prime256v1 => |comptime_cert_named_curve| {
+                        const Ecdsa = CertificateParser.SchemeEcdsaCert(comptime_scheme, comptime_cert_named_curve);
+                        const key = try Ecdsa.PublicKey.fromSec1(pub_key);
+                        const sig = try Ecdsa.Signature.fromDer(signature);
+                        try sig.verify(message, key);
+                    },
+                    else => return error.TlsUnknownSignatureScheme,
+                }
+            },
+            inline .rsa_pss_rsae_sha256,
+            .rsa_pss_rsae_sha384,
+            .rsa_pss_rsae_sha512,
+            => |comptime_scheme| {
+                if (pub_key_algo != .rsaEncryption) return error.TlsBadSignatureScheme;
+                const Hash = SchemeHash(comptime_scheme);
+                const pk = try rsa.PublicKey.fromDer(pub_key);
+                const sig = rsa.Pss(Hash).Signature{ .bytes = signature };
+                try sig.verify(message, pk, null);
+            },
+            else => return error.TlsUnknownSignatureScheme,
+        }
     }
 
     const EcdsaKeyPair = union(enum) {
@@ -190,7 +296,12 @@ pub const cert = struct {
 };
 
 pub const CertificateBuilder = struct {
-    cert_key_pair: *CertKeyPair,
+    /// Caller-owned cert/key bundle to serialize. Read-only — the
+    /// builder only inspects bundle bytes + signature schemes; it never
+    /// writes through this pointer. Holding it `*const` lets callers
+    /// share a single `CertKeyPair` between concurrent handshakes
+    /// without copies or const-stripping.
+    cert_key_pair: *const CertKeyPair,
     transcript: *Transcript,
     tls_version: proto.Version = .tls_1_3,
     side: proto.Side = .client,
@@ -307,6 +418,40 @@ pub const CertificateParser = struct {
     skip_verify: bool = false,
     now_sec: i64,
 
+    /// Slice of the first (leaf) certificate observed during
+    /// `parseCertificate`. Points into the caller-provided record buffer,
+    /// so it is VALID ONLY UNTIL `parseCertificate` returns. Callers that
+    /// wish to retain the bytes MUST copy into long-lived storage before
+    /// the borrowed buffer's lifetime ends.
+    leaf_der: ?[]const u8 = null,
+
+    /// Phase 1b.19 — caller-provided backing storage for per-cert DER
+    /// slices observed during `parseCertificate`. When non-null, the
+    /// parser fills entries `[0..cert_count]` with slices pointing into
+    /// the caller-provided record buffer; same lifetime contract as
+    /// `leaf_der` (VALID ONLY UNTIL `parseCertificate` returns). Callers
+    /// retaining the bytes MUST copy into long-lived storage before
+    /// that buffer goes out of scope.
+    ///
+    /// Pass a slice into a stack-allocated `[max_chain_depth]?[]const u8`
+    /// array sized to the configured cap. Storage is filled at indices
+    /// `[0..cert_count]`; entries past `cert_count` stay at their
+    /// pre-call value (callers should initialize the array to `null`).
+    ///
+    /// Optional: null = parse leaf only (back-compat with pre-1b.19
+    /// callers; `leaf_der` still gets populated as before).
+    chain_der_storage: ?[]?[]const u8 = null,
+
+    /// Defensive cap on the number of certs we'll walk in the peer's
+    /// Certificate message. Defaults to 255 (u8 max, effectively
+    /// unbounded). Callers configuring tighter caps trade compatibility
+    /// with deeply-nested chains for fail-early protection.
+    max_chain_depth: u8 = 255,
+
+    /// Count of certificates parsed so far in `parseCertificate`. Used
+    /// to enforce `max_chain_depth`.
+    cert_count: u8 = 0,
+
     pub fn parseCertificate(h: *CertificateParser, d: *record.Decoder, tls_version: proto.Version) !void {
         if (tls_version == .tls_1_3) {
             const request_context = try d.decode(u8);
@@ -318,12 +463,37 @@ pub const CertificateParser = struct {
         const certs_len = try d.decode(u24);
         const start_idx = d.idx;
         while (d.idx - start_idx < certs_len) {
+            // Chain-depth cap. Fail early during the DER walk if the
+            // peer's chain exceeds the configured limit.
+            if (h.cert_count == h.max_chain_depth) return error.PeerCertChainTooDeep;
+            h.cert_count += 1;
+
             const crt_len = try d.decode(u24);
             const crt = try d.slice(crt_len);
             if (tls_version == .tls_1_3) {
                 // certificate extensions present in tls 1.3
                 try d.skip(try d.decode(u16));
             }
+
+            // Record the leaf DER on the first cert. The slice points
+            // into the caller-owned record buffer; the caller must copy
+            // into long-lived memory before that buffer goes out of
+            // scope if they want to retain the bytes.
+            if (h.leaf_der == null) h.leaf_der = crt;
+
+            // Phase 1b.19 — also record into caller-provided chain
+            // storage when configured. `cert_count` was just
+            // incremented to N for the Nth cert (1-based) above; store
+            // at index N-1. Same lifetime contract as `leaf_der`.
+            //
+            // Storage is sized to `max_chain_depth` by the caller; the
+            // chain-depth cap check at the top of this loop ensures we
+            // never index past that bound.
+            if (h.chain_der_storage) |storage| {
+                const idx: usize = @intCast(h.cert_count - 1);
+                if (idx < storage.len) storage[idx] = crt;
+            }
+
             if (trust_chain_established)
                 continue;
 
@@ -416,7 +586,7 @@ pub const CertificateParser = struct {
         }
     }
 
-    fn SchemeEcdsaCert(comptime scheme: proto.SignatureScheme, comptime cert_named_curve: Certificate.NamedCurve) type {
+    pub fn SchemeEcdsaCert(comptime scheme: proto.SignatureScheme, comptime cert_named_curve: Certificate.NamedCurve) type {
         const Sha256 = crypto.hash.sha2.Sha256;
         const Sha384 = crypto.hash.sha2.Sha384;
         const Ecdsa = crypto.sign.ecdsa.Ecdsa;
@@ -557,4 +727,181 @@ test "DhKeyPair.x25519" {
     );
     var kp = try DhKeyPair.init(seed, &.{.x25519});
     try testing.expectEqualSlices(u8, expected, try kp.sharedKey(.x25519, server_pub_key));
+}
+
+test "CertificateParser: chain_der_storage captures every cert slice in order" {
+    // Drives parseCertificate directly with a hand-built record.Decoder
+    // containing 3 concatenated copies of the same self-signed leaf DER.
+    // skip_verify = true bypasses the chain-walk verify step (each cert
+    // would otherwise fail with IssuerMismatch against itself); the
+    // chain_der_storage capture happens BEFORE the verify gate so this
+    // test pins the storage shape without needing a real multi-cert
+    // chain fixture.
+    //
+    // The companion 3-cert end-to-end test (real handshake with real
+    // chain) lives in handshake_server.zig — this one isolates the
+    // CertificateParser surface.
+    const alloc = testing.allocator;
+    const cert_pem = @embedFile("testdata/mtls_test_cert.pem");
+
+    // Extract the leaf DER from the PEM fixture via cert.fromSlice.
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var bundle = try cert.fromSlice(alloc, io, cert_pem);
+    defer bundle.deinit(alloc);
+
+    var it = bundle.map.iterator();
+    const entry = it.next() orelse return error.NoCertInFixture;
+    const offset = entry.value_ptr.*;
+    const outer = try Certificate.der.Element.parse(bundle.bytes.items, offset);
+    const leaf_der = bundle.bytes.items[offset..outer.slice.end];
+
+    // Hand-build a record.Decoder buffer for the post-record-header
+    // bytes parseCertificate consumes: u8 request_context (0 for tls
+    // 1.3 server-flight Certificate message), u24 certs_len, then for
+    // each cert: u24 crt_len, crt bytes, u16 extensions_len (0 for tls
+    // 1.3).
+    const n_certs = 3;
+    const per_cert_overhead = 3 + 2; // u24 crt_len + u16 extensions_len
+    const certs_len: u24 = @intCast((leaf_der.len + per_cert_overhead) * n_certs);
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(alloc);
+    // u8 request_context (tls 1.3): must be 0 in server flight.
+    try buf.append(alloc, 0);
+    // certs_len header
+    try buf.append(alloc, @intCast((certs_len >> 16) & 0xff));
+    try buf.append(alloc, @intCast((certs_len >> 8) & 0xff));
+    try buf.append(alloc, @intCast(certs_len & 0xff));
+    var i: usize = 0;
+    while (i < n_certs) : (i += 1) {
+        const cl: u24 = @intCast(leaf_der.len);
+        try buf.append(alloc, @intCast((cl >> 16) & 0xff));
+        try buf.append(alloc, @intCast((cl >> 8) & 0xff));
+        try buf.append(alloc, @intCast(cl & 0xff));
+        try buf.appendSlice(alloc, leaf_der);
+        try buf.append(alloc, 0); // extensions_len high byte
+        try buf.append(alloc, 0); // extensions_len low byte
+    }
+
+    var dec: record.Decoder = .init(.handshake, buf.items);
+    var root_ca = try cert.fromSlice(alloc, io, cert_pem);
+    defer root_ca.deinit(alloc);
+
+    var storage: [4]?[]const u8 = .{ null, null, null, null };
+    var parser: CertificateParser = .{
+        .root_ca = root_ca,
+        .host = "",
+        .skip_verify = true,
+        .now_sec = std.Io.Clock.real.now(io).toSeconds(),
+        .chain_der_storage = storage[0..],
+    };
+
+    try parser.parseCertificate(&dec, .tls_1_3);
+
+    try testing.expectEqual(@as(u8, 3), parser.cert_count);
+    try testing.expect(parser.leaf_der != null);
+    try testing.expectEqualSlices(u8, leaf_der, parser.leaf_der.?);
+
+    // chain_der_storage[0..2] must each hold the same DER (leaf-first
+    // ordering is universal; this is the load-bearing assertion).
+    try testing.expect(storage[0] != null);
+    try testing.expect(storage[1] != null);
+    try testing.expect(storage[2] != null);
+    try testing.expectEqual(@as(?[]const u8, null), storage[3]); // unused slot
+    try testing.expectEqualSlices(u8, leaf_der, storage[0].?);
+    try testing.expectEqualSlices(u8, leaf_der, storage[1].?);
+    try testing.expectEqualSlices(u8, leaf_der, storage[2].?);
+}
+
+test "CertificateParser: chain_der_storage null preserves back-compat (no capture)" {
+    // When chain_der_storage is null, parseCertificate behaves exactly
+    // as before 1b.19 — leaf_der captured, chain not. Pins the
+    // back-compat contract for pre-1b.19 callers.
+    const alloc = testing.allocator;
+    const cert_pem = @embedFile("testdata/mtls_test_cert.pem");
+
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var bundle = try cert.fromSlice(alloc, io, cert_pem);
+    defer bundle.deinit(alloc);
+
+    var it = bundle.map.iterator();
+    const entry = it.next() orelse return error.NoCertInFixture;
+    const offset = entry.value_ptr.*;
+    const outer = try Certificate.der.Element.parse(bundle.bytes.items, offset);
+    const leaf_der = bundle.bytes.items[offset..outer.slice.end];
+
+    const certs_len: u24 = @intCast(leaf_der.len + 5);
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(alloc);
+    // u8 request_context (tls 1.3): must be 0 in server flight.
+    try buf.append(alloc, 0);
+    try buf.append(alloc, @intCast((certs_len >> 16) & 0xff));
+    try buf.append(alloc, @intCast((certs_len >> 8) & 0xff));
+    try buf.append(alloc, @intCast(certs_len & 0xff));
+    const cl: u24 = @intCast(leaf_der.len);
+    try buf.append(alloc, @intCast((cl >> 16) & 0xff));
+    try buf.append(alloc, @intCast((cl >> 8) & 0xff));
+    try buf.append(alloc, @intCast(cl & 0xff));
+    try buf.appendSlice(alloc, leaf_der);
+    try buf.append(alloc, 0);
+    try buf.append(alloc, 0);
+
+    var dec: record.Decoder = .init(.handshake, buf.items);
+    var root_ca = try cert.fromSlice(alloc, io, cert_pem);
+    defer root_ca.deinit(alloc);
+
+    var parser: CertificateParser = .{
+        .root_ca = root_ca,
+        .host = "",
+        .skip_verify = true,
+        .now_sec = std.Io.Clock.real.now(io).toSeconds(),
+        // chain_der_storage left null
+    };
+
+    try parser.parseCertificate(&dec, .tls_1_3);
+    try testing.expectEqual(@as(u8, 1), parser.cert_count);
+    try testing.expect(parser.leaf_der != null);
+    // No storage was provided → no per-slice capture happened.
+    try testing.expectEqual(@as(?[]?[]const u8, null), parser.chain_der_storage);
+}
+
+test "1b.23 Bug 1 chip — CertKeyPair.signSelfTest + verifySelfTest round-trip (ECDSA P-256)" {
+    const alloc = testing.allocator;
+    const cert_pem = @embedFile("testdata/mtls_test_cert.pem");
+    const key_pem = @embedFile("testdata/mtls_test_key.pem");
+
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var pair = try CertKeyPair.fromSlice(alloc, io, cert_pem, key_pem);
+    defer pair.deinit(alloc);
+
+    const message = "test-vector";
+    var sig_buf: [MAX_SIGNATURE_LEN]u8 = undefined;
+    const sig = try pair.signSelfTest(message, &sig_buf, testu.random(0));
+    try pair.verifySelfTest(message, sig);
+}
+
+test "1b.23 Bug 1 chip — verifySelfTest rejects wrong message" {
+    const alloc = testing.allocator;
+    const cert_pem = @embedFile("testdata/mtls_test_cert.pem");
+    const key_pem = @embedFile("testdata/mtls_test_key.pem");
+
+    var threaded: std.Io.Threaded = .init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var pair = try CertKeyPair.fromSlice(alloc, io, cert_pem, key_pem);
+    defer pair.deinit(alloc);
+
+    var sig_buf: [MAX_SIGNATURE_LEN]u8 = undefined;
+    const sig = try pair.signSelfTest("message-a", &sig_buf, testu.random(0));
+    // ECDSA verify over a wrong message produces an invalid-signature error.
+    // The exact error name may be SignatureVerificationFailed or similar.
+    const result = pair.verifySelfTest("message-b", sig);
+    try testing.expectError(error.SignatureVerificationFailed, result);
 }
